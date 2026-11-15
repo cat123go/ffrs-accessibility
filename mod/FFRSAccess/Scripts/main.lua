@@ -60,13 +60,13 @@ local MOVE_INPUT_ACTION = "/Game/Input/Action/Map/IA_Map_UnitMove.IA_Map_UnitMov
 local INJECT_INPUT_FUNCTION = "/Script/EnhancedInput.EnhancedInputSubsystemInterface:InjectInputVectorForAction"
 local WALK_ARRIVAL_DISTANCE = 200
 local WALK_MIN_PROGRESS = 30
-local WALK_POINT_REACHED_DISTANCE = 100
+local WALK_POINT_REACHED_DISTANCE = 70
 local STEER_TICK_MS = 1 -- praktisch jeder Frame: eine eingespeiste Eingabe gilt nur fuer einen Frame
 local GIMMICK_STATE_DEACTIVE = 1 -- eMapGimmickState::Deactive
 local DIRECTION_NAMES = { "vorne", "vorne rechts", "rechts", "hinten rechts", "hinten", "hinten links", "links", "vorne links" }
 
 local QUEST_CATEGORY = "Questziel"
-local TARGET_CATEGORIES = { QUEST_CATEGORY, "Aufträge", "Story-Ereignisse", "Personen", "Gegner", "Schätze", "Ausgänge", "Türen", "Speicherpunkte", "Objekte", "Erkunden" }
+local TARGET_CATEGORIES = { QUEST_CATEGORY, "Aufträge", "Story-Ereignisse", "Personen", "Gegner", "Schätze", "Heiligtümer", "Ausgänge", "Türen", "Speicherpunkte", "Objekte", "Erkunden" }
 local NPC_NAMES_FILE = "npc_names.txt"
 local PICKUP_MAX_DISTANCE = 500
 -- Spielbare Figuren reden in Gespraechen mit, ihr Name gehoert nie zur angesprochenen Person.
@@ -128,6 +128,7 @@ local INTERACT_TYPES = {
     [24] = { "Personen", "Chocoboladen" },
     [25] = { "Personen", "Chocoborennen" },
     [26] = { "Personen", "Musikladen" },
+    [27] = { "Objekte", "Briefkasten" }, -- eMapInteractType::DLCShop, BP_MapGimmick_DLC
     [28] = { "Personen", "Wahrsager" },
     [29] = { "Personen", "Kolosseum" },
     [30] = { "Personen", "Kolosseum" },
@@ -1837,6 +1838,20 @@ local function conditionMet(condition)
     return not ok or met ~= false
 end
 
+-- Bedingung als Text pruefen, etwa "{flag:1003}". nil, wenn das Spiel sie nicht auswerten kann.
+function menuInfo.conditionString(text)
+    local ok, met = pcall(function()
+        if not conditionFunctions or not conditionFunctions:IsValid() then
+            conditionFunctions = StaticFindObject("/Script/mucha.Default__CPP_BFL_Condition")
+        end
+        return conditionFunctions:IsMeetCondition(text, false)
+    end)
+    if ok and type(met) == "boolean" then
+        return met
+    end
+    return nil
+end
+
 local function isExitUsable(trigger)
     local ok, usable = pcall(function()
         if trigger.m_IsEventOnly then
@@ -2238,7 +2253,7 @@ end
 menuInfo.OBJECT_KINDS = {
     { "Floor_Elevator", "Aufzug" }, { "CallSwitch", "Rufschalter für Aufzug" }, { "Switch", "Schalter" },
     { "Lamp", "Lampe" }, { "MagicPot", "Topf" }, { "Medal", "Medaille" }, { "FieldItem", "Fundstück" },
-    { "Ladder", "Leiter" },
+    { "Ladder", "Leiter" }, { "Gimmick_DLC", "Briefkasten" },
 }
 
 function menuInfo.objectKind(actor)
@@ -2466,6 +2481,9 @@ scanTargets = function(categoryName, origin)
     if categoryName == menuInfo.REQUEST_CATEGORY then
         return menuInfo.requestTargets(origin)
     end
+    if categoryName == menuInfo.SHRINE_CATEGORY then
+        return menuInfo.shrineTargets(origin)
+    end
     local targets = {}
     local seen = {}
     local questKeys = categoryName == QUEST_CATEGORY and questTargetKeys() or nil
@@ -2480,7 +2498,8 @@ scanTargets = function(categoryName, origin)
     for _, source in ipairs(sources) do
         for _, actor in ipairs(FindAllOf(source[1]) or {}) do
             local path = actor:IsValid() and objectPath(actor)
-            if path and not seen[path] then
+            -- BlockObject_DLC ist nur der Kollisionskoerper am Briefkasten (gleiche Stelle, Typ 4) und kam doppelt.
+            if path and not seen[path] and not path:find("BlockObject_DLC", 1, true) then
                 seen[path] = true
                 local interactType = interactTypeOf(actor)
                 local info = interactType and INTERACT_TYPES[interactType] or source[2]
@@ -2768,6 +2787,176 @@ function menuInfo.questAwayTargets(origin)
                 })
             end
         end
+    end
+    table.sort(result, function(a, b)
+        return a.distance < b.distance
+    end)
+    return result
+end
+
+-- Heiligtuemer (Wunsch User 12.11.): die Lichtschreine mit den Visionen. Spieldaten (DT_MapData_*, Wld*_GD):
+-- Kartentyp VisionSmallShrine, Eingang je ein Ausgang auf der Weltkarte. Bis zur Vision fuehrt der Ausgang auf die
+-- erste Karte (first), danach auf die Wiederbesuchskarte (revisit), deren Name den Helden nennt. Das Flag merkt sich
+-- die Vision; vor Fortschritt 1095 fuehrt der Ausgang nirgends hin. Drinnen liegt die Vision als Ereignis-Ausloeser
+-- (Com_00Com_203_EV: BP_MapGimmick_EventTrigger, Int_LegendEV_01_01, sichtbar solange !{flag:1003}).
+-- Die Hoehlen mit Kartentyp VisionSmallShrine (02Lan_42 usw.) sind Kaempfe gegen starke Gegner, keine Visionen.
+menuInfo.SHRINE_CATEGORY = "Heiligtümer"
+menuInfo.SHRINE_UNLOCK = "{progress:0}>=1095"
+menuInfo.SHRINES = {
+    { first = 10200, revisit = 10220, flag = 1000 }, { first = 10201, revisit = 10221, flag = 1001 },
+    { first = 10202, revisit = 10222, flag = 1002 }, { first = 10203, revisit = 10223, flag = 1003 },
+    { first = 10205, revisit = 10225, flag = 1007 }, { first = 10206, revisit = 10226, flag = 1009 },
+    { first = 10207, revisit = 10227, flag = 1008 }, { first = 10208, revisit = 10228, flag = 1005 },
+    { first = 10209, revisit = 10229, flag = 1006 }, { first = 10210, revisit = 10230, flag = 1010 },
+    { first = 10211, revisit = 10231, flag = 1011 }, { first = 10212, revisit = 10232, flag = 1012 },
+    { first = 10213, revisit = 10233, flag = 1013 }, { first = 10214, revisit = 10234, flag = 1014 },
+    { first = 10215, revisit = 10235, flag = 1015 }, { first = 10216, revisit = 10236, flag = 1016 },
+    -- Sephiroth: beide Eintraege fuehren nach 10218, mit {flag:1037} ist der Ausgang weg. Keine Fortschrittsgrenze.
+    { first = 10218, flag = 1037, always = true },
+    -- Liaa Tron: kein Ausgang in den Daten gefunden, nur fuer "drinnen".
+    { first = 10020, revisit = 10237 },
+}
+menuInfo.WORLD_MAP_ID = 1000
+
+function menuInfo.shrineOf(mapId)
+    for _, entry in ipairs(menuInfo.SHRINES) do
+        if mapId == entry.first or mapId == entry.revisit then
+            return entry
+        end
+    end
+    return nil
+end
+
+function menuInfo.shrineName(entry)
+    return (entry.revisit and mapNameById(entry.revisit)) or mapNameById(entry.first) or "Heiligtum"
+end
+
+-- "offen", "erhalten" oder "verschlossen"; ohne lesbares Flag nil.
+function menuInfo.shrineState(entry)
+    if not entry.always and menuInfo.conditionString(menuInfo.SHRINE_UNLOCK) == false then
+        return "verschlossen"
+    end
+    local taken = entry.flag and menuInfo.conditionString("{flag:" .. entry.flag .. "}")
+    if taken == nil then
+        return nil
+    end
+    return taken and "erhalten" or "offen"
+end
+
+local SHRINE_STATE_TEXT = { offen = "Vision noch nicht geholt", erhalten = "Vision schon geholt",
+    verschlossen = "noch verschlossen" }
+
+-- Heiligtum hinter einem Ausgang: irgendein Eintrag der Liste oder das feste Ziel ist eine Heiligtumskarte.
+function menuInfo.shrineOfExit(trigger)
+    local entry = nil
+    pcall(function()
+        entry = menuInfo.shrineOf(trigger.m_MapId)
+        trigger.mTransitionDataList:ForEach(function(_, element)
+            entry = entry or menuInfo.shrineOf(element:get().mapId)
+        end)
+    end)
+    return entry
+end
+
+function menuInfo.currentMapId()
+    local ok, mapId = pcall(function()
+        return menuInfo.defaultObject("CPP_BFL_Map"):GetCurrentMapId()
+    end)
+    return ok and type(mapId) == "number" and mapId or nil
+end
+
+function menuInfo.openShrineCount()
+    local count = 0
+    for _, entry in ipairs(menuInfo.SHRINES) do
+        if entry.flag and not entry.always and menuInfo.shrineState(entry) == "offen" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+-- Ziele der Kategorie Heiligtuemer; wanted (Heiligtum-Reise) beschraenkt auf ein Heiligtum.
+-- Drinnen: die Vision; ist sie geholt, der Ausgang. Draussen: Eingaenge, offene Visionen zuerst. Ohne Eingang hier
+-- (Stadt, Dungeon): Ausgang mit den wenigsten Kartenwechseln zu einem offenen Heiligtum.
+function menuInfo.shrineTargets(origin, wanted)
+    local current = menuInfo.currentMapId()
+    local inside = current and menuInfo.shrineOf(current)
+    if inside then
+        local result = {}
+        for _, target in ipairs(scanTargets("Story-Ereignisse", origin)) do
+            target.label = "Vision"
+            target.shrine, target.vision = inside, true
+            table.insert(result, target)
+        end
+        if #result == 0 then
+            for _, target in ipairs(scanTargets("Ausgänge", origin)) do
+                target.label = target.label .. ", Vision hier schon geholt"
+                target.shrine, target.leave = inside, true
+                table.insert(result, target)
+            end
+        end
+        log("Heiligtum " .. current .. ": " .. #result .. " Ziele, Vision " .. tostring(result[1] and result[1].vision))
+        return result
+    end
+    local result = {}
+    for _, trigger in ipairs(FindAllOf("CPP_MapTransitionTrigger") or {}) do
+        local entry = trigger:IsValid() and isExitUsable(trigger) and menuInfo.shrineOfExit(trigger)
+        if entry and (not wanted or wanted == entry) then
+            local state = menuInfo.shrineState(entry)
+            local mapOk, mapId = pcall(menuInfo.exitTargetMap, trigger)
+            -- Sephiroth: ist die Szene vorbei, fuehrt der Ausgang nirgends mehr hin.
+            if not (entry.always and mapOk and type(mapId) == "number" and mapId <= 0) then
+                local location = menuInfo.interactPoint(trigger)
+                local label = menuInfo.shrineName(entry)
+                table.insert(result, {
+                    actor = trigger,
+                    path = objectPath(trigger),
+                    label = SHRINE_STATE_TEXT[state] and (label .. ", " .. SHRINE_STATE_TEXT[state]) or label,
+                    shrine = entry,
+                    rank = state == "offen" and 0 or state == nil and 1 or state == "erhalten" and 2 or 3,
+                    location = { X = location.X, Y = location.Y, Z = location.Z },
+                    distance = distance2D(location, origin),
+                })
+                log("Heiligtum-Eingang " .. objectPath(trigger) .. ": " .. entry.first .. " " .. tostring(state))
+            end
+        end
+    end
+    if #result > 0 or current == menuInfo.WORLD_MAP_ID then
+        table.sort(result, function(a, b)
+            if a.rank ~= b.rank then
+                return a.rank < b.rank
+            end
+            return a.distance < b.distance
+        end)
+        return result
+    end
+    -- Keine Eingaenge hier: hinaus Richtung Heiligtum (in Staedten und Dungeons meist zur Weltkarte).
+    -- Waehrend einer Heiligtum-Reise zaehlt deren Ziel mit, auch wenn die Vision schon geholt ist.
+    local journeyShrine = menuInfo.activeShrine and menuInfo.activeShrine()
+    local bestSteps, best, goal = math.huge, {}, nil
+    for _, entry in ipairs(menuInfo.SHRINES) do
+        if entry.flag and (wanted == entry
+                or (not wanted and (entry == journeyShrine or menuInfo.shrineState(entry) == "offen"))) then
+            local exits, steps = menuInfo.exitsToward(entry.first)
+            if #exits > 0 and steps < bestSteps then
+                bestSteps, best, goal = steps, exits, entry
+            end
+        end
+    end
+    for _, trigger in ipairs(best) do
+        local location = menuInfo.interactPoint(trigger)
+        local name = exitTargetName(trigger, {}) or menuInfo.displayLabel("Ausgang", trigger, 3)
+        table.insert(result, {
+            actor = trigger,
+            path = objectPath(trigger),
+            label = name .. ", Weg zum Heiligtum",
+            away = goal,
+            location = { X = location.X, Y = location.Y, Z = location.Z },
+            distance = distance2D(location, origin),
+        })
+    end
+    if goal then
+        log("Heiligtum: " .. #result .. " Ausgaenge Richtung " .. goal.first .. ", " .. bestSteps .. " Wechsel")
     end
     table.sort(result, function(a, b)
         return a.distance < b.distance
@@ -3766,14 +3955,174 @@ function navGrid.chooseGoal(previous, destination, actor, noPartial)
     return best, true
 end
 
+-- Wandabstand je Punkt (Wunsch User 14.11.: direkt hinlaufen statt gegen Waende). 0 = Rand der begehbaren Flaeche
+-- (ein Nachbar fehlt), 1 = eine Zelle (75 cm) weiter innen usw. Log 14.11. 21:11 (Dng_02Lan_40): Der kuerzeste Weg
+-- klebte am Navmesh-Rand, 8 cm neben der Kante; die Figur ist breiter und blieb an colwall001 haengen, immer wieder.
+navGrid.CLEAR_MAX = 3
+navGrid.CLEAR_COST = { [0] = 4, [1] = 1, [2] = 0.3 }
+navGrid.AVOID_COST = 30
+navGrid.AVOID_SECONDS = 180
+navGrid.AVOID_RADIUS = 130
+navGrid.avoid = {}
+
+function navGrid.ensureClearance()
+    if navGrid.clearanceFor == navGrid.generation and navGrid.clearanceCount == navGrid.count
+        and not navGrid.clearanceDirty then
+        return
+    end
+    navGrid.clearanceFor, navGrid.clearanceCount, navGrid.clearanceDirty = navGrid.generation, navGrid.count, false
+    local queue = {}
+    for _, node in pairs(navGrid.nodes) do
+        node.clear = nil
+        for index = 1, #navGrid.DIRECTIONS do
+            if not node.links[index] then
+                node.clear = 0
+                queue[#queue + 1] = node
+                break
+            end
+        end
+    end
+    local head = 1
+    while queue[head] do
+        local node = queue[head]
+        head = head + 1
+        if node.clear < navGrid.CLEAR_MAX then
+            for index = 1, #navGrid.DIRECTIONS do
+                local link = node.links[index]
+                if link and link.clear == nil then
+                    link.clear = node.clear + 1
+                    queue[#queue + 1] = link
+                end
+            end
+        end
+    end
+end
+
+function navGrid.clearOf(node)
+    return node.clear or navGrid.CLEAR_MAX
+end
+
+-- Stellen, an denen die Figur hing, eine Weile meiden; ist es der einzige Weg, fuehrt er trotzdem dort entlang.
+function navGrid.markAvoid(points)
+    local untilTime, marked = os.clock() + navGrid.AVOID_SECONDS, 0
+    local range = math.ceil(navGrid.AVOID_RADIUS / navGrid.CELL)
+    for _, point in ipairs(points) do
+        local baseX, baseY = navGrid.cellOf(point.X), navGrid.cellOf(point.Y)
+        for ix = baseX - range, baseX + range do
+            for iy = baseY - range, baseY + range do
+                for _, node in ipairs(navGrid.cells[ix .. ":" .. iy] or {}) do
+                    if distance2D(point, node) <= navGrid.AVOID_RADIUS
+                        and (not point.Z or math.abs(node.Z - point.Z) < 250) then
+                        navGrid.avoid[node] = untilTime
+                        marked = marked + 1
+                    end
+                end
+            end
+        end
+    end
+    log(string.format("Wegekarte: %d Punkte gemieden", marked))
+end
+
+function navGrid.stepCost(node, now)
+    local cost = 1 + (navGrid.CLEAR_COST[navGrid.clearOf(node)] or 0)
+    local avoidUntil = navGrid.avoid[node]
+    if avoidUntil then
+        if now < avoidUntil then
+            cost = cost + navGrid.AVOID_COST
+        else
+            navGrid.avoid[node] = nil
+        end
+    end
+    return cost
+end
+
+-- A* nur ueber die erreichbaren Punkte (reachable aus flood); Kosten steigen nahe an Waenden und an gemiedenen Stellen.
+function navGrid.cheapestPath(start, goal, reachable)
+    navGrid.ensureClearance()
+    local now = os.clock()
+    local heap, cost, previous, closed = {}, { [start] = 0 }, { [start] = start }, {}
+    local function estimate(node)
+        return math.abs(node.ix - goal.ix) + math.abs(node.iy - goal.iy)
+    end
+    local function push(node, priority)
+        local index = #heap + 1
+        heap[index] = { priority, node }
+        while index > 1 do
+            local parent = math.floor(index / 2)
+            if heap[parent][1] <= heap[index][1] then
+                break
+            end
+            heap[parent], heap[index] = heap[index], heap[parent]
+            index = parent
+        end
+    end
+    local function pop()
+        local top = heap[1]
+        local last = table.remove(heap)
+        if #heap > 0 then
+            heap[1] = last
+            local index = 1
+            while true do
+                local left, right, smallest = index * 2, index * 2 + 1, index
+                if heap[left] and heap[left][1] < heap[smallest][1] then
+                    smallest = left
+                end
+                if heap[right] and heap[right][1] < heap[smallest][1] then
+                    smallest = right
+                end
+                if smallest == index then
+                    break
+                end
+                heap[smallest], heap[index] = heap[index], heap[smallest]
+                index = smallest
+            end
+        end
+        return top[2]
+    end
+    push(start, estimate(start))
+    while #heap > 0 do
+        local node = pop()
+        if node == goal then
+            local reversed, current = {}, goal
+            while current ~= start do
+                reversed[#reversed + 1] = current
+                current = previous[current]
+            end
+            local path = { start }
+            for index = #reversed, 1, -1 do
+                path[#path + 1] = reversed[index]
+            end
+            return path
+        end
+        if not closed[node] then
+            closed[node] = true
+            for index = 1, #navGrid.DIRECTIONS do
+                local link = node.links[index]
+                if link and reachable[link] and not closed[link] then
+                    local newCost = cost[node] + navGrid.stepCost(link, now)
+                    if (not cost[link] or newCost < cost[link]) and navGrid.gateOpen(node, link) then
+                        cost[link], previous[link] = newCost, node
+                        push(link, newCost + estimate(link))
+                    end
+                end
+            end
+        end
+    end
+    return nil
+end
+
 -- Prueft nur vorhandene Kanten: Ist die gerade Linie zwischen zwei Knoten durchgehend begehbar?
-function navGrid.lineFree(from, to)
+-- minClear: Zwischenpunkte muessen mindestens so weit von der Wand weg sein (Abkuerzungen schneiden sonst Ecken).
+function navGrid.lineFree(from, to, minClear)
     local current = from
     local steps = math.max(math.abs(to.ix - from.ix), math.abs(to.iy - from.iy)) * 2
     local function step(dx, dy)
         for index, direction in ipairs(navGrid.DIRECTIONS) do
             if direction[1] == dx and direction[2] == dy then
                 local link = current.links[index]
+                if link and minClear and link ~= to and navGrid.clearOf(link) < minClear then
+                    return nil
+                end
                 return link and navGrid.gateOpen(current, link) and link or nil
             end
         end
@@ -3819,12 +4168,23 @@ function navGrid.lineFree(from, to)
     return current == to
 end
 
+-- Eine Abkuerzung darf nicht naeher an die Wand als der Weg selbst auf diesem Stueck (hoechstens 1 Zelle gefordert).
+function navGrid.pathClear(path, first, last)
+    local lowest = 1
+    for index = first + 1, last - 1 do
+        lowest = math.min(lowest, navGrid.clearOf(path[index]))
+    end
+    return lowest
+end
+
 function navGrid.smooth(path)
+    navGrid.ensureClearance()
     local result, index = { path[1] }, 1
     while index < #path do
         local reach = index + 1
         local candidate = math.min(index + navGrid.SMOOTH_STRIDE, #path)
-        while candidate > reach and candidate - index <= navGrid.SMOOTH_MAX and navGrid.lineFree(path[index], path[candidate]) do
+        while candidate > reach and candidate - index <= navGrid.SMOOTH_MAX
+            and navGrid.lineFree(path[index], path[candidate], navGrid.pathClear(path, index, candidate)) do
             reach = candidate
             candidate = math.min(candidate + navGrid.SMOOTH_STRIDE, #path)
             if candidate == reach then
@@ -3851,14 +4211,21 @@ function navGrid.route(origin, destination, actor)
     if partial and distance2D(goal, destination) > distance2D(origin, destination) - navGrid.CELL * 2 then
         return nil
     end
-    local reversed, node = {}, goal
-    while node ~= start do
-        table.insert(reversed, node)
-        node = previous[node]
+    local cheapOk, path = pcall(navGrid.cheapestPath, start, goal, previous)
+    if not cheapOk then
+        log("Wegekarte: Wandabstand-Suche fehlgeschlagen: " .. tostring(path))
+        path = nil
     end
-    local path = { start }
-    for index = #reversed, 1, -1 do
-        table.insert(path, reversed[index])
+    if not path then
+        local reversed, node = {}, goal
+        while node ~= start do
+            table.insert(reversed, node)
+            node = previous[node]
+        end
+        path = { start }
+        for index = #reversed, 1, -1 do
+            table.insert(path, reversed[index])
+        end
     end
     local smoothed = navGrid.smooth(path)
     local points, length, last = {}, 0, origin
@@ -3884,6 +4251,7 @@ function navGrid.blockAhead(location, point)
             node.links[index] = false
             link.links[direction[3]] = false
             log("Wegekarte: Kante gesperrt bei " .. node.key)
+            navGrid.clearanceDirty = true
         end
     end
 end
@@ -3910,6 +4278,7 @@ function navGrid.blockAround(x, y, keep)
         end
     end
     log(string.format("Wegekarte: %d Kanten gesperrt um %.0f %.0f", blocked, x, y))
+    navGrid.clearanceDirty = navGrid.clearanceDirty or blocked > 0
 end
 
 -- Benennt ein Hindernis ueber den Namen seines Modells. Die Woerter sind geraten, bis die Log-Zeilen `Hindernis:` echte Namen zeigen.
@@ -4191,7 +4560,8 @@ function navRoute.filterReachable(pawn, origin, targets, categoryName, keepAll)
         local keep = verdict.keep
         target.doorHops = verdict.doorHops or target.doorHops
         -- Markierte Ziele bleiben auch ohne bekannten Weg waehlbar, mit Richtung und Entfernung.
-        if not keep and (categoryName == QUEST_CATEGORY or categoryName == menuInfo.REQUEST_CATEGORY) then
+        if not keep and (categoryName == QUEST_CATEGORY or categoryName == menuInfo.REQUEST_CATEGORY
+                or categoryName == menuInfo.SHRINE_CATEGORY) then
             log("Questziel ohne bekannten Weg: " .. target.label .. " " .. target.path)
             keep = true
         end
@@ -5333,6 +5703,12 @@ function navRoute.updateStuck(walk, location, now)
         if obstacle and obstacle.X then
             navGrid.blockAround(obstacle.X, obstacle.Y, navGrid.nearest(location))
         end
+        -- Log 14.11.: "0 Kanten gesperrt", derselbe Weg kam wieder, die Figur lief 6 Mal an dieselbe Mauer.
+        local avoidPoints = { { X = location.X, Y = location.Y, Z = location.Z - navGrid.halfHeight } }
+        if obstacle and obstacle.X then
+            avoidPoints[2] = { X = obstacle.X, Y = obstacle.Y, Z = location.Z - navGrid.halfHeight }
+        end
+        navGrid.markAvoid(avoidPoints)
         walk.detourAngle = navRoute.nextSidestep(walk, location, point)
         walk.detourUntil = now + navRoute.SIDESTEP_SECONDS
         log(string.format("Haengt bei %.0f %.0f %.0f, Seitenschritt %d Grad", location.X, location.Y, location.Z, walk.detourAngle))
@@ -5385,6 +5761,12 @@ local function selectTarget(steps)
         if categoryName == QUEST_CATEGORY then
             speak(QUEST_CATEGORY .. ", hier nichts markiert."
                 .. (menuInfo.questElsewhere and (" Ziel: " .. menuInfo.questElsewhere .. ".") or ""), true)
+            return
+        end
+        if categoryName == menuInfo.SHRINE_CATEGORY then
+            local open = menuInfo.openShrineCount()
+            speak(categoryName .. ", hier in der Nähe keins. " .. (open == 1 and "Noch 1 Vision offen."
+                or ("Noch " .. open .. " Visionen offen.")), true)
             return
         end
         speak(categoryName .. (#allTargets > 0 and ", nichts erreichbar." or ", nichts gefunden."), true)
@@ -5539,11 +5921,49 @@ end
 -- Neu geplant wird nur bei Start, nach gesperrter Eingabe (Szene, Kampf, Menue, Laden) und nach Kartenwechsel,
 -- damit die Figur am Ziel stehen bleibt, bis man selbst Enter drueckt.
 -- Bei Auftraegen folgt die Reise den Auftraegen des gewaehlten Eintrags (questIds) ueber alle Karten.
-function navRoute.startJourney(questIds)
+function navRoute.startJourney(questIds, shrine)
     navRoute.journey = { pending = true, level = navGrid.level, calmSince = os.clock() - navRoute.JOURNEY_CALM_SECONDS,
-        questIds = questIds }
-    log("Questreise gestartet")
-    speak("Questreise gestartet.", true)
+        questIds = questIds, shrine = shrine }
+    log(shrine and ("Heiligtum-Reise gestartet: " .. shrine.first) or "Questreise gestartet")
+    speak(shrine and ("Weg zum Heiligtum gestartet, " .. menuInfo.shrineName(shrine) .. ".") or "Questreise gestartet.", true)
+end
+
+function menuInfo.activeShrine()
+    return navRoute.journey and navRoute.journey.shrine or nil
+end
+
+-- Heiligtum-Reise (Wunsch User 12.11.): Ausgang Richtung Weltkarte, Eingang des Heiligtums, drinnen die Vision.
+-- Am Eingang bleibt die Figur stehen, wenn das Spiel dort eine Aktion anbietet; nach dem Kartenwechsel geht es weiter.
+function navRoute.planShrineLeg(pawn, origin)
+    local journey = navRoute.journey
+    local targets = navRoute.filterReachable(pawn, origin, menuInfo.shrineTargets(origin, journey.shrine),
+        menuInfo.SHRINE_CATEGORY, true)
+    local target = targets[1]
+    if target and target.leave then
+        navRoute.journey = nil
+        log("Heiligtum-Reise: Vision geholt, beendet")
+        speak("Die Vision dieses Heiligtums hast du. Weg zum Heiligtum beendet.", true)
+        return
+    end
+    if not target then
+        navRoute.journey = nil
+        log("Heiligtum-Reise: kein Schritt auf Karte " .. tostring(menuInfo.currentMapId()))
+        speak("Weg zum Heiligtum: hier ist kein nächster Schritt bekannt. Beendet.", true)
+        return
+    end
+    if target.distance < navRoute.JOURNEY_NEAR_DISTANCE
+            or (target.path == journey.arrivedPath and journey.arrivedLevel == navGrid.level) then
+        log("Heiligtum-Reise: am Ziel " .. target.label)
+        return
+    end
+    for index, name in ipairs(TARGET_CATEGORIES) do
+        if name == menuInfo.SHRINE_CATEGORY then
+            selectedCategory = index
+        end
+    end
+    selectedTargetPath = target.path
+    log("Heiligtum-Reise: " .. target.label .. " " .. target.path)
+    navRoute.startWalk()
 end
 
 -- Strg+E (Wunsch User 10.11.): an das naechste Story-Ereignis heranspringen, ein paar Meter davor, Blick zum
@@ -5660,6 +6080,9 @@ end
 function navRoute.planJourneyLeg(pawn)
     local journey = navRoute.journey
     local origin = pawn:K2_GetActorLocation()
+    if journey.shrine then
+        return navRoute.planShrineLeg(pawn, origin)
+    end
     local categoryName = journey.questIds and menuInfo.REQUEST_CATEGORY or QUEST_CATEGORY
     local target = navRoute.journeyPick(pawn, origin, categoryName, journey.questIds and function(candidate)
         for questId in pairs(candidate.questIds or {}) do
@@ -5779,6 +6202,31 @@ local function toggleWalk()
         end
         navRoute.startJourney(questIds)
         return
+    end
+    -- Heiligtuemer: Pos1 fuehrt ueber alle Karten bis zur Vision des gewaehlten Heiligtums.
+    if categoryName == menuInfo.SHRINE_CATEGORY then
+        if navRoute.journey and navRoute.journey.shrine then
+            navRoute.journey = nil
+            log("Heiligtum-Reise beendet")
+            speak("Weg zum Heiligtum beendet.", true)
+            return
+        end
+        local pawn = playerUnit()
+        local chosen = nil
+        for _, candidate in ipairs(pawn and navRoute.targetsFor(categoryName, pawn:K2_GetActorLocation()) or {}) do
+            if candidate.path == selectedTargetPath then
+                chosen = candidate
+            end
+        end
+        if not chosen then
+            speak("Kein Ziel ausgewählt.", true)
+            return
+        end
+        local shrine = chosen.shrine or chosen.away
+        if shrine and not chosen.leave then
+            navRoute.startJourney(nil, shrine)
+            return
+        end
     end
     -- Ein eigenes Ziel ersetzt die Questreise.
     if navRoute.journey then
@@ -5972,6 +6420,202 @@ local function updateDetour(walk, location, now)
     end
 end
 
+-- Lenkung nach dem Vorbild der FF7-Remake-Mod (Wunsch User 15.11.): vorausschauen statt Punkt fuer Punkt,
+-- Fortschritt per Projektion auf den Weg, geglaettete Richtung, Neuplanung abseits des Wegs, eigene Eingabe hat Vorrang.
+navRoute.steer = {
+    LOOKAHEAD_MIN = 150,
+    LOOKAHEAD_MAX = 600,
+    CORRIDOR = 70,
+    AIM_SECONDS = 0.1,
+    AIM_TESTS = 4,
+    SMOOTHING = 0.35, -- Anteil der neuen Richtung je Bild bei 60 Bildern pro Sekunde
+    DENSE_STEP = 100,
+    WINDOW = 12,
+    OFF_ROUTE = 400,
+    JUMP = 500,
+    REPLAN_GAP = 2,
+    MANUAL_STICK = 0.35,
+    MANUAL_CHECK_SECONDS = 0.05,
+    MANUAL_KEYS = { "W", "A", "S", "D" },
+    STICK_KEYS = { "Gamepad_LeftX", "Gamepad_LeftY" },
+}
+
+-- Fuellt den Weg ab dem aktuellen Abschnitt alle 100 cm mit Zwischenpunkten auf, damit die Vorausschau Ecken abkuerzen kann.
+function navRoute.densify(walk)
+    if walk.densePoints == walk.points then
+        return
+    end
+    local source = walk.points
+    local first = math.max(1, walk.pointIndex - 1)
+    local dense, index = { source[first] }, 1
+    for i = first + 1, #source do
+        local a, b = source[i - 1], source[i]
+        local parts = math.max(1, math.floor(distance2D(a, b) / navRoute.steer.DENSE_STEP))
+        for part = 1, parts do
+            local t = part / parts
+            dense[#dense + 1] = { X = a.X + (b.X - a.X) * t, Y = a.Y + (b.Y - a.Y) * t, Z = a.Z + (b.Z - a.Z) * t }
+        end
+        if i == walk.pointIndex then
+            index = #dense
+        end
+    end
+    walk.points, walk.densePoints, walk.pointIndex, walk.aimIndex = dense, dense, index, nil
+end
+
+-- Projiziert die Figur auf die naechsten Abschnitte; wer einen Punkt im Korridor ueberholt hat, hat ihn erreicht.
+-- Liefert den Abstand zum Weg.
+function navRoute.advanceAlongRoute(walk, location)
+    local points, steer = walk.points, navRoute.steer
+    local bestIndex, nearest = nil, math.huge
+    for i = math.max(2, walk.pointIndex), math.min(#points, walk.pointIndex + steer.WINDOW) do
+        local a, b = points[i - 1], points[i]
+        if math.abs(location.Z - b.Z) < navRoute.FLOOR_HEIGHT then
+            local dx, dy = b.X - a.X, b.Y - a.Y
+            local lengthSq = dx * dx + dy * dy
+            local t = lengthSq > 0 and ((location.X - a.X) * dx + (location.Y - a.Y) * dy) / lengthSq or 1
+            local clamped = math.max(0, math.min(1, t))
+            local px, py = a.X + dx * clamped, a.Y + dy * clamped
+            local off = math.sqrt((location.X - px) ^ 2 + (location.Y - py) ^ 2)
+            nearest = math.min(nearest, off)
+            if off <= steer.CORRIDOR and t >= 0 then
+                bestIndex = (t >= 1 and i < #points) and i + 1 or i
+            end
+        end
+    end
+    if bestIndex and bestIndex > walk.pointIndex then
+        walk.pointIndex = bestIndex
+    end
+    if #points < 2 then
+        return distance2D(location, points[1])
+    end
+    return nearest
+end
+
+-- Kann die Figur geradeaus zu diesem Wegpunkt gehen? Mit Wegekarte ueber das Raster (Boden, Waende, Wandabstand),
+-- sonst Kapsel plus Boden in der Mitte, damit keine Abkuerzung ueber Luecken fuehrt.
+function navRoute.straightFree(from, point)
+    local floorZ = from.Z - (navGrid.halfHeight or 100)
+    if navGrid.count and navGrid.count > 0 then
+        local radius = navGrid.CELL * 1.5
+        local a = navGrid.nodeNear({ X = from.X, Y = from.Y, Z = floorZ }, nil, radius, 150)
+        local b = navGrid.nodeNear(point, nil, radius, 150)
+        if a and b then
+            navGrid.ensureClearance()
+            return navGrid.lineFree(a, b, 1) == true
+        end
+    end
+    if navGrid.disabled or not navGrid.system or math.abs(point.Z - floorZ) > 60 then
+        return false
+    end
+    if not navGrid.sweepFree(from.X, from.Y, floorZ, point.X, point.Y, point.Z) then
+        return false
+    end
+    return navGrid.groundBelow((from.X + point.X) / 2, (from.Y + point.Y) / 2, floorZ + 100, floorZ - 120) ~= nil
+end
+
+-- Weitester Wegpunkt innerhalb der Vorausschau (1,5 bis 6 m je nach Tempo), zu dem die gerade Linie frei ist.
+-- Hoechstens 4 Pruefungen, alle 0,1 s neu; sonst der naechste Wegpunkt wie bisher.
+function navRoute.aimPoint(walk, location, now)
+    local steer = navRoute.steer
+    if walk.aimIndex and walk.aimPoints == walk.points and now < walk.aimUntil and walk.aimIndex >= walk.pointIndex then
+        return walk.points[walk.aimIndex]
+    end
+    walk.aimUntil, walk.aimPoints = now + steer.AIM_SECONDS, walk.points
+    local reach = steer.LOOKAHEAD_MAX
+    local speedOk, speed = pcall(function()
+        local velocity = walk.pawn:GetVelocity()
+        return math.sqrt(velocity.X * velocity.X + velocity.Y * velocity.Y)
+    end)
+    if speedOk and speed then
+        reach = math.max(steer.LOOKAHEAD_MIN, math.min(steer.LOOKAHEAD_MAX, speed))
+    end
+    local candidates = {}
+    local index = walk.pointIndex
+    local along = distance2D(location, walk.points[index])
+    while index < #walk.points do
+        local nextAlong = along + distance2D(walk.points[index], walk.points[index + 1])
+        if nextAlong > reach then
+            break
+        end
+        index, along = index + 1, nextAlong
+        candidates[#candidates + 1] = index
+    end
+    local chosen, count = walk.pointIndex, #candidates
+    local tests = math.min(steer.AIM_TESTS, count)
+    for test = 1, tests do
+        local pick = candidates[count - math.floor((test - 1) * count / tests)]
+        local ok, free = pcall(navRoute.straightFree, location, walk.points[pick])
+        if not ok and not walk.aimErrorLogged then
+            walk.aimErrorLogged = true
+            log("Vorausschau nicht pruefbar: " .. tostring(free))
+        end
+        if ok and free then
+            chosen = pick
+            break
+        end
+    end
+    walk.aimIndex = chosen
+    return walk.points[chosen]
+end
+
+-- Neue Richtung nur anteilig uebernehmen (35 % je Bild), das verhindert Zittern zwischen Wegpunkten.
+function navRoute.smoothDirection(walk, x, y, now)
+    local elapsed = now - (walk.steerAt or now)
+    walk.steerAt = now
+    if not walk.steerX then
+        walk.steerX, walk.steerY = x, y
+        return x, y
+    end
+    local share = 1 - (1 - navRoute.steer.SMOOTHING) ^ math.max(1, elapsed * 60)
+    local sx, sy = walk.steerX + (x - walk.steerX) * share, walk.steerY + (y - walk.steerY) * share
+    local length = math.sqrt(sx * sx + sy * sy)
+    if length < 0.01 then
+        sx, sy = x, y
+    else
+        sx, sy = sx / length, sy / length
+    end
+    walk.steerX, walk.steerY = sx, sy
+    return sx, sy
+end
+
+-- Drueckt der Spieler selbst WASD oder den linken Stick (ueber 35 %)? Die eingespeiste Eingabe zaehlt hier nicht mit,
+-- sie geht an die Eingabeaktion, nicht an die Tasten.
+function navRoute.manualInput(walk, now)
+    local steer = navRoute.steer
+    if walk.manualBroken or now < (walk.manualCheckAt or 0) then
+        return nil
+    end
+    walk.manualCheckAt = now + steer.MANUAL_CHECK_SECONDS
+    if not navRoute.manualKeys then
+        navRoute.manualKeys, navRoute.stickKeys = {}, {}
+        for _, name in ipairs(steer.MANUAL_KEYS) do
+            table.insert(navRoute.manualKeys, { name = name, key = { KeyName = FName(name) } })
+        end
+        for _, name in ipairs(steer.STICK_KEYS) do
+            table.insert(navRoute.stickKeys, { name = name, key = { KeyName = FName(name) } })
+        end
+    end
+    local ok, pressed = pcall(function()
+        for _, entry in ipairs(navRoute.manualKeys) do
+            if walk.controller:IsInputKeyDown(entry.key) then
+                return entry.name
+            end
+        end
+        for _, entry in ipairs(navRoute.stickKeys) do
+            if math.abs(walk.controller:GetInputAnalogKeyState(entry.key)) > steer.MANUAL_STICK then
+                return entry.name
+            end
+        end
+        return nil
+    end)
+    if not ok then
+        walk.manualBroken = true
+        log("Eigene Eingabe nicht lesbar: " .. tostring(pressed))
+        return nil
+    end
+    return pressed
+end
+
 -- Dieselbe Groesse wie bei Tasteneingabe: X nach rechts, Y nach vorne, relativ zur Kamera.
 local function walkInputValue(walk, directionX, directionY)
     local yaw = math.rad(walk.controller.PlayerCameraManager:GetCameraRotation().Yaw)
@@ -6010,9 +6654,35 @@ local function tickSteering()
     if not (activeWalk and activeWalk.pawn:IsValid()) then
         return
     end
+    local now = os.clock()
+    local manual = navRoute.manualInput(activeWalk, now)
+    if manual then
+        log("Eigene Eingabe (" .. manual .. "), Laufen beendet")
+        navRoute.chain, navRoute.liftChain = nil, nil
+        endWalk(navRoute.journey and "Selbst gesteuert, Laufen und Questreise beendet." or "Selbst gesteuert, Laufen beendet.")
+        navRoute.journey = nil
+        return
+    end
     local location = activeWalk.pawn:K2_GetActorLocation()
-    activeWalk.walked = activeWalk.walked + distance2D(location, activeWalk.lastLocation)
+    local moved = distance2D(location, activeWalk.lastLocation)
+    if moved > navRoute.steer.JUMP then
+        activeWalk.jumped = true
+        log(string.format("Sprung um %.0f cm waehrend des Laufens", moved))
+    else
+        activeWalk.walked = activeWalk.walked + moved
+    end
     activeWalk.lastLocation = location
+    if activeWalk.routed then
+        navRoute.densify(activeWalk)
+        local off = navRoute.advanceAlongRoute(activeWalk, location)
+        local offRoute = off > navRoute.steer.OFF_ROUTE and activeWalk.detourAngle == 0
+        if (activeWalk.jumped or offRoute) and now - (activeWalk.replannedAt or 0) >= navRoute.steer.REPLAN_GAP then
+            log(activeWalk.jumped and "Neu planen nach Sprung" or string.format("Neu planen: %.0f cm neben dem Weg", off))
+            activeWalk.jumped, activeWalk.replannedAt = false, now
+            navRoute.replan(activeWalk, location)
+            navRoute.densify(activeWalk)
+        end
+    end
     local point = activeWalk.points[activeWalk.pointIndex]
     while activeWalk.pointIndex < #activeWalk.points and navRoute.reached(location, point) do
         activeWalk.pointIndex = activeWalk.pointIndex + 1
@@ -6021,16 +6691,23 @@ local function tickSteering()
     local length = distance2D(location, point)
     if length > 0 then
         if activeWalk.routed then
-            navRoute.updateStuck(activeWalk, location, os.clock())
-            point = activeWalk.points[activeWalk.pointIndex]
+            navRoute.updateStuck(activeWalk, location, now)
+            -- updateStuck kann neu geplant haben.
+            navRoute.densify(activeWalk)
+            if activeWalk.detourAngle == 0 then
+                point = navRoute.aimPoint(activeWalk, location, now)
+            else
+                point = activeWalk.points[activeWalk.pointIndex]
+            end
             length = math.max(distance2D(location, point), 1)
         else
-            updateDetour(activeWalk, location, os.clock())
+            updateDetour(activeWalk, location, now)
         end
         local angle = math.rad(activeWalk.detourAngle)
         local toX, toY = (point.X - location.X) / length, (point.Y - location.Y) / length
         local directionX = toX * math.cos(angle) - toY * math.sin(angle)
         local directionY = toX * math.sin(angle) + toY * math.cos(angle)
+        directionX, directionY = navRoute.smoothDirection(activeWalk, directionX, directionY, now)
         if activeWalk.useInputAction then
             local right, forward = walkInputValue(activeWalk, directionX, directionY)
             if not injectMoveInput(right, forward) then

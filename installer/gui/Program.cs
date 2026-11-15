@@ -49,6 +49,50 @@ namespace FFRSSetup
             }
         }
 
+        // Fuer Rueckfragen: Mit welchem Konto laeuft das Setup? Gibt man bei der Admin-Abfrage ein anderes Konto an,
+        // landet das Protokoll in dessen TEMP-Ordner.
+        public static string AccountInfo()
+        {
+            return $"Setup {Updater.CurrentVersion}, Konto {Environment.UserDomainName}\\{Environment.UserName}, "
+                + (IsElevated() ? "mit" : "ohne") + " Administratorrechte, Protokoll " + LogPath;
+        }
+
+        // Eine schreibgeschuetzte Datei (etwa dwmapi.dll einer anderen Mod) laesst sich auch als Administrator nicht
+        // ueberschreiben oder loeschen: Schreibschutz vorher entfernen.
+        public static void MakeWritable(string path, Action<string> report)
+        {
+            if (!File.Exists(path))
+                return;
+            var attributes = File.GetAttributes(path);
+            if ((attributes & FileAttributes.ReadOnly) == 0)
+                return;
+            File.SetAttributes(path, attributes & ~FileAttributes.ReadOnly);
+            report($"Schreibschutz entfernt: {path}");
+        }
+
+        public static void MakeTreeWritable(string directory, Action<string> report)
+        {
+            if (!Directory.Exists(directory))
+                return;
+            foreach (var file in Directory.GetFiles(directory, "*", SearchOption.AllDirectories))
+                MakeWritable(file, report);
+        }
+
+        public static string DescribeFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path))
+                    return "Datei ist noch nicht da";
+                var info = new FileInfo(path);
+                return $"Datei da, {info.Length} Bytes, Attribute {info.Attributes}, geändert {info.LastWriteTime:yyyy-MM-dd HH:mm}";
+            }
+            catch (Exception ex)
+            {
+                return "Datei nicht lesbar: " + ex.Message;
+            }
+        }
+
         public static bool IsElevated()
         {
             try
@@ -147,12 +191,43 @@ namespace FFRSSetup
         // weil sie nicht im Paket stecken.
         private static readonly string[] KeepIfPresent = { "ue4ss/UE4SS-settings.ini", "ue4ss/Mods/mods.txt" };
 
+        // Gleicher Inhalt wie im Paket? Erst die Groesse, dann SHA-256. Ist die vorhandene Datei nicht lesbar,
+        // gilt sie als verschieden und wird geschrieben wie bisher.
+        private static bool SameContent(ZipArchiveEntry entry, string target)
+        {
+            try
+            {
+                var info = new FileInfo(target);
+                if (!info.Exists || info.Length != entry.Length)
+                    return false;
+                using (var sha = System.Security.Cryptography.SHA256.Create())
+                {
+                    byte[] packaged, present;
+                    using (var stream = entry.Open())
+                        packaged = sha.ComputeHash(stream);
+                    using (var stream = new FileStream(target, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+                        present = sha.ComputeHash(stream);
+                    return packaged.SequenceEqual(present);
+                }
+            }
+            catch (Exception)
+            {
+                return false;
+            }
+        }
+
+        private static bool IsProxy(string entryName)
+        {
+            return string.Equals(entryName, "dateien/Win64/dwmapi.dll", StringComparison.OrdinalIgnoreCase);
+        }
+
         public static void Install(string game, Action<string> report)
         {
             var win64 = Path.Combine(game, @"FFRS\Binaries\Win64");
             var modDir = Path.Combine(win64, @"ue4ss\Mods\FFRSAccess");
             bool hadUe4ss = File.Exists(Path.Combine(win64, @"ue4ss\UE4SS.dll"));
-            int written = 0;
+            int written = 0, unchanged = 0, ue4ssWritten = 0;
+            Exception proxyError = null;
             var targets = new List<string>();
             using (var zip = OpenPayload())
             {
@@ -174,10 +249,31 @@ namespace FFRSSetup
                         // Liesmich und Lizenzen kommen zur Mod.
                         target = Path.Combine(modDir, name.Replace('/', '\\'));
                     }
+                    // Bei Updates nur Geaendertes schreiben: dwmapi.dll und UE4SS bleiben meist gleich, ein Virenscanner
+                    // oder fehlende Rechte koennen sie dann nicht mehr stoeren.
+                    if (SameContent(entry, target))
+                    {
+                        unchanged++;
+                        continue;
+                    }
                     Directory.CreateDirectory(Path.GetDirectoryName(target));
                     try
                     {
+                        MakeWritable(target, report);
                         entry.ExtractToFile(target, true);
+                    }
+                    catch (Exception ex) when (IsProxy(name) && (ex is UnauthorizedAccessException || ex is IOException))
+                    {
+                        // Nur diese Datei macht Probleme (Virenscanner: sieht aus wie eine untergeschobene Systemdatei).
+                        // Den Rest trotzdem installieren, am Ende gezielt melden.
+                        report($"dwmapi.dll nicht geschrieben ({ex.GetType().Name}: {ex.Message}), {DescribeFile(target)}. Installiere den Rest weiter.");
+                        proxyError = ex;
+                        continue;
+                    }
+                    catch (UnauthorizedAccessException)
+                    {
+                        report($"Zugriff verweigert auf {target}: {DescribeFile(target)}");
+                        throw;
                     }
                     catch (IOException ex)
                     {
@@ -186,17 +282,41 @@ namespace FFRSSetup
                     }
                     targets.Add(target);
                     written++;
+                    if (!target.StartsWith(modDir, StringComparison.OrdinalIgnoreCase))
+                        ue4ssWritten++;
                 }
             }
-            File.WriteAllText(Path.Combine(modDir, "enabled.txt"), "");
+            var enabled = Path.Combine(modDir, "enabled.txt");
+            if (!File.Exists(enabled))
+                File.WriteAllText(enabled, "");
             // Ein Virenscanner kann Dateien gleich nach dem Schreiben wieder entfernen.
             System.Threading.Thread.Sleep(1500);
             var missing = targets.Where(t => !File.Exists(t)).ToList();
+            var proxyPath = Path.Combine(win64, "dwmapi.dll");
+            if (proxyError == null && missing.Remove(proxyPath))
+                proxyError = new IOException("dwmapi.dll wurde geschrieben und ist danach wieder verschwunden.");
+            if (proxyError != null)
+            {
+                report($"Alles andere ist installiert, {written} Dateien neu oder geändert, {unchanged} unverändert.");
+                // Ohne Adminrechte zuerst den Neustart anbieten; der ueberspringt dann alles schon Geschriebene.
+                if (proxyError is UnauthorizedAccessException && !IsElevated())
+                    throw new UnauthorizedAccessException("dwmapi.dll im Spielordner: " + proxyError.Message, proxyError);
+                throw new IOException("Alles ist installiert bis auf die Datei dwmapi.dll im Ordner " + win64 + ". Ohne sie startet die Mod nicht. "
+                    + "Meist blockiert ein Virenscanner oder der Windows-Schutz „Überwachter Ordnerzugriff“ genau diese Datei, weil sie wie eine untergeschobene Systemdatei aussieht. "
+                    + "Bitte im Schutzverlauf von Windows-Sicherheit oder im Virenscanner nachsehen, die Datei bzw. das Setup zulassen "
+                    + "oder den Spielordner als Ausnahme eintragen und das Setup danach noch einmal starten.", proxyError);
+            }
             if (missing.Count > 0)
                 throw new IOException("Diese Dateien wurden geschrieben, sind aber wieder verschwunden, vermutlich hat ein Virenscanner sie entfernt: "
                     + string.Join(", ", missing.Select(Path.GetFileName)));
-            report(hadUe4ss ? "UE4SS aktualisiert, vorhandene Einstellungen behalten." : "UE4SS installiert.");
-            report($"Mod FFRSAccess installiert, {written} Dateien.");
+            if (!hadUe4ss)
+                report("UE4SS installiert.");
+            else if (ue4ssWritten > 0)
+                report("UE4SS aktualisiert, vorhandene Einstellungen behalten.");
+            else
+                report("UE4SS ist schon aktuell.");
+            report(written == 0 ? $"Mod FFRSAccess ist schon aktuell, {unchanged} Dateien unverändert."
+                : $"Mod FFRSAccess installiert, {written} Dateien neu oder geändert, {unchanged} unverändert.");
         }
 
         public static void Uninstall(string game, bool removeUe4ss, Action<string> report)
@@ -206,6 +326,7 @@ namespace FFRSSetup
             var modDir = Path.Combine(ue4ss, @"Mods\FFRSAccess");
             if (Directory.Exists(modDir))
             {
+                MakeTreeWritable(modDir, report);
                 Directory.Delete(modDir, true);
                 report("Mod FFRSAccess entfernt.");
             }
@@ -217,7 +338,11 @@ namespace FFRSSetup
             {
                 var proxy = Path.Combine(win64, "dwmapi.dll");
                 if (File.Exists(proxy))
+                {
+                    MakeWritable(proxy, report);
                     File.Delete(proxy);
+                }
+                MakeTreeWritable(ue4ss, report);
                 Directory.Delete(ue4ss, true);
                 report("UE4SS entfernt.");
             }
@@ -572,6 +697,7 @@ namespace FFRSSetup
         private void Run(string mode, string game, Action action, string doneMessage)
         {
             SetBusy(true);
+            Report(Installer.AccountInfo());
             Report("Spielordner: " + game);
             try
             {

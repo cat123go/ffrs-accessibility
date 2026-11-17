@@ -164,6 +164,32 @@ else if (args[0] == "nav")
         }
     }
 }
+else if (args[0] == "raw")
+{
+    // Dateien unveraendert herausschreiben (etwa die Videos .usm): raw <zielordner> <regex>; "sizes" statt Zielordner listet nur Groessen.
+    var regex = new Regex(args[2], RegexOptions.IgnoreCase);
+    long total = 0;
+    var count = 0;
+    foreach (var pair in provider.Files.Where(f => regex.IsMatch(f.Key)).OrderBy(f => f.Key))
+    {
+        total += pair.Value.Size;
+        count++;
+        if (args[1] == "sizes")
+        {
+            Console.WriteLine($"{pair.Value.Size,12} {pair.Key}");
+            continue;
+        }
+        var target = Path.Combine(args[1], pair.Key.Replace('/', Path.DirectorySeparatorChar));
+        Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+        File.WriteAllBytes(target, pair.Value.Read());
+        Console.WriteLine(pair.Key);
+    }
+    Console.WriteLine($"{count} Dateien, {total / 1048576.0:F0} MB");
+}
+else if (args[0] == "walk")
+{
+    Walk.Run(provider, args, outDir);
+}
 else if (args[0] == "locres")
 {
     // Die Sprachdatei des Spiels als Tabelle: locres <sprache> <datei>, je Zeile Namensraum, Schluessel, Text.

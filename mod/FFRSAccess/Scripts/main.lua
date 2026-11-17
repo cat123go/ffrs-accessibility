@@ -66,7 +66,7 @@ local GIMMICK_STATE_DEACTIVE = 1 -- eMapGimmickState::Deactive
 local DIRECTION_NAMES = { "vorne", "vorne rechts", "rechts", "hinten rechts", "hinten", "hinten links", "links", "vorne links" }
 
 local QUEST_CATEGORY = "Questziel"
-local TARGET_CATEGORIES = { QUEST_CATEGORY, "Aufträge", "Story-Ereignisse", "Personen", "Gegner", "Schätze", "Heiligtümer", "Ausgänge", "Türen", "Speicherpunkte", "Objekte", "Erkunden" }
+local TARGET_CATEGORIES = { QUEST_CATEGORY, "Aufträge", "Wichtige Gespräche", "Auftraggeber", "Händler", "Story-Ereignisse", "Personen", "Gegner", "Schätze", "Heiligtümer", "Esper", "Ausgänge", "Türen", "Speicherpunkte", "Objekte", "Erkunden" }
 local NPC_NAMES_FILE = "npc_names.txt"
 local PICKUP_MAX_DISTANCE = 500
 -- Spielbare Figuren reden in Gespraechen mit, ihr Name gehoert nie zur angesprochenen Person.
@@ -110,30 +110,30 @@ local INTERACT_TYPES = {
     [6] = { "Objekte", "Untersuchen" },
     [7] = { "Objekte", "Untersuchen" },
     [8] = { "Objekte", "Mechanismus" },
-    [9] = { "Personen", "Handelsschiff" },
+    [9] = { "Händler", "Handelsschiff" },
     [10] = { "Gegner", "Kampf" },
     [11] = { "Schätze", "Schatztruhe" },
-    [12] = { "Objekte", "Esper" },
+    [12] = { "Esper", "Esper-Wohnstätte" }, -- eigene Kategorie, nur eingezeichnete (menuInfo.esperTargets)
     [13] = { "Ausgänge", "Tür" },
     [14] = { "Objekte", "Fahrzeug" },
     [15] = { "Objekte", "Schiff" },
     [16] = { "Ausgänge", "Anlegestelle" },
-    [17] = { "Personen", "Laden" },
-    [18] = { "Personen", "Waffenladen" },
-    [19] = { "Personen", "Rüstungsladen" },
-    [20] = { "Personen", "Accessoireladen" },
+    [17] = { "Händler", "Laden" },
+    [18] = { "Händler", "Waffenladen" },
+    [19] = { "Händler", "Rüstungsladen" },
+    [20] = { "Händler", "Accessoireladen" },
     [21] = { "Personen", "Gasthaus" },
-    [22] = { "Personen", "Auftragstafel" },
+    [22] = { "Auftraggeber", "Auftragstafel" },
     [23] = { "Personen", "Bank" },
-    [24] = { "Personen", "Chocoboladen" },
+    [24] = { "Händler", "Chocoboladen" },
     [25] = { "Personen", "Chocoborennen" },
-    [26] = { "Personen", "Musikladen" },
+    [26] = { "Händler", "Musikladen" },
     [27] = { "Objekte", "Briefkasten" }, -- eMapInteractType::DLCShop, BP_MapGimmick_DLC
     [28] = { "Personen", "Wahrsager" },
     [29] = { "Personen", "Kolosseum" },
     [30] = { "Personen", "Kolosseum" },
     [31] = { "Personen", "Kolosseum" },
-    [32] = { "Personen", "Visionsladen" },
+    [32] = { "Händler", "Visionsladen" },
     [33] = { "Speicherpunkte", "Speicherpunkt" },
     [34] = { "Ausgänge", "Ausgang" },
     [35] = { "Ausgänge", "Ausgang" },
@@ -625,9 +625,11 @@ function menuInfo.tickWorldMap()
     local layout = menuInfo.worldMapLayout
     if not layout or not layout:IsValid() then
         menuInfo.worldMapWidgets, menuInfo.worldMapSpoken, menuInfo.worldMapPending = nil, nil, nil
+        menuInfo.fastTravelJump, menuInfo.fastTravelIndex = nil, nil
         return
     end
     menuInfo.worldMapWidgets = menuInfo.worldMapWidgets or {}
+    menuInfo.tickFastTravelJump()
     if not menuInfo.worldMapSpoken then
         -- Den Gebietsnamen sagt schon die Bildschirmansage beim Oeffnen.
         local island = menuInfo.findNamedWidget(layout, menuInfo.WORLD_MAP_PANELS[1], 0)
@@ -647,6 +649,11 @@ function menuInfo.tickWorldMap()
         elseif text == menuInfo.worldMapPending[name] and text ~= menuInfo.worldMapSpoken[name] then
             menuInfo.worldMapSpoken[name] = text
             log("Weltkarte " .. name .. ": " .. text)
+            local jump = menuInfo.fastTravelJump
+            if jump and name == "WBP_WM_LandmarkQuestInfo" then
+                text = text .. ", " .. jump.position
+                menuInfo.fastTravelJump = nil
+            end
             speak(text, true)
         else
             menuInfo.worldMapPending[name] = text
@@ -2018,6 +2025,93 @@ local function isEventTriggerActive(actor)
     return not ok or (active and visible)
 end
 
+-- Aktives Gespraech einer Figur (Wunsch User 16.11.: Listen zeigten Leute, bei denen nichts ging). Laut Spieldaten
+-- (Town_04Dir_02_01_EV) haben Passanten weder Interaktionstyp noch Ereignisse (NPC_C_47, C_17, C_24); das Spiel
+-- spielt die erste Gruppe aus m_EventSettings, deren Bedingung erfuellt ist (C_37: {progress:32}==20 SubEv, sonst FEV).
+-- Rueckgabe: Ereignis-ID oder "" (Gespraech ohne bekannte ID), nil = nichts zu sagen.
+function menuInfo.npcActiveEvent(actor)
+    local visibleOk, visibleCondition = pcall(function()
+        return actor.m_VisiblFlagCondition
+    end)
+    if visibleOk and visibleCondition and not conditionMet(visibleCondition) then
+        return nil
+    end
+    local found
+    pcall(function()
+        actor.m_EventSettings.EventList:ForEach(function(_, element)
+            if found then
+                return
+            end
+            local group = element:get()
+            if conditionMet(group.Condition) then
+                group.EventList:ForEach(function(_, candidate)
+                    found = found or candidate:get().EventId:ToString()
+                end)
+                found = found or ""
+            end
+        end)
+    end)
+    if found then
+        return found
+    end
+    pcall(function()
+        actor.m_EventList:ForEach(function(_, element)
+            local event = element:get()
+            if not found and conditionMet(event.Condition) then
+                found = event.EventId:ToString()
+            end
+        end)
+    end)
+    if found then
+        return found
+    end
+    local talkOk, talkCount = pcall(function()
+        return actor.m_TalkData.TalkIdList:GetArrayNum()
+    end)
+    if talkOk and type(talkCount) == "number" and talkCount > 0 then
+        return ""
+    end
+    return nil
+end
+
+-- Figuren mit eigenem Interaktionstyp (Laeden, Gasthaus ...) bleiben; ohne Typ zaehlt nur ein aktives Gespraech.
+function menuInfo.npcTalkable(actor, interactType)
+    if interactType and interactType ~= 1 then
+        return true
+    end
+    return menuInfo.npcActiveEvent(actor) ~= nil
+end
+
+-- Art des aktiven Gespraechs nach der Ereignis-ID; FEV_ und andere sind Plauderei.
+menuInfo.STORY_EVENT_KINDS = {
+    { "^C%d%d_", "Hauptgeschichte" },
+    { "^ChrEv_", "Figurenepisode" },
+    { "^SubEv_", "Nebengeschichte" },
+}
+function menuInfo.npcStoryKind(actor)
+    local eventId = menuInfo.npcActiveEvent(actor)
+    if not eventId or eventId == "" then
+        return nil, eventId
+    end
+    for _, entry in ipairs(menuInfo.STORY_EVENT_KINDS) do
+        if eventId:find(entry[1]) then
+            return entry[2], eventId
+        end
+    end
+    return nil, eventId
+end
+
+-- Untersuchen-Punkte (DotObject) entstehen erst im Spiel und hatten in Dilmagia (16.11.) nichts zum Untersuchen.
+function menuInfo.hasActiveEvent(actor)
+    local active = false
+    pcall(function()
+        actor.m_EventList:ForEach(function(_, element)
+            active = active or conditionMet(element:get().Condition)
+        end)
+    end)
+    return active
+end
+
 local function npcNamesPath()
     local info = debug and debug.getinfo and debug.getinfo(1, "S")
     local scriptsDir = info and info.source and info.source:match("^@(.*[\\/])")
@@ -2148,11 +2242,13 @@ end
 function menuInfo.requestGivers()
     local givers = {}
     local titles = {}
+    menuInfo.requestGiverTitles = {}
     local ok, err = pcall(function()
         local currentGroup = menuInfo.mapGroup(menuInfo.defaultObject("CPP_BFL_Map"):GetCurrentMapId())
-        local function addGiver(giver, unitId)
+        local function addGiver(giver, unitId, title)
             if giver and giver.Data.Type == 1 and giver.mapId > 0 and menuInfo.mapGroup(giver.mapId) == currentGroup then
                 givers[giver.Data.ID] = unitId
+                menuInfo.requestGiverTitles[giver.Data.ID] = title
             end
         end
         -- Rueckgabewerte kommen als Lua-Tabelle, Felder im Spielspeicher als TArray. RequesterId war am 05.11.
@@ -2193,9 +2289,10 @@ function menuInfo.requestGivers()
                 log("Auftrag Element: " .. type(request) .. " " .. tostring(request) .. ", Felder " .. table.concat(keys, " ")
                     .. ", RequesterId " .. tostring(request.RequesterId) .. ", ID " .. tostring(request.ID))
             end
-            addGiver(request.RequesterId, request.RequesterMapUnitId)
+            local title = textOf(request.Name)
+            addGiver(request.RequesterId, request.RequesterMapUnitId, title)
             each(request.SubRequesterIds, function(subGiver)
-                addGiver(subGiver, -1)
+                addGiver(subGiver, -1, title)
             end)
             table.insert(titles, tostring(request.ID) .. " " .. tostring(textOf(request.Name)))
         end)
@@ -2222,6 +2319,12 @@ end
 -- das das Spiel am Objekt zeigt (FindInteractActionText), sonst das passende aus ST_UI_Interact.
 -- Wie der Eintrag im Hauptmenue; zeigt die aktuellen Ziele aller angenommenen Auftraege.
 menuInfo.REQUEST_CATEGORY = TARGET_CATEGORIES[2]
+-- Wunsch User 16.11.: Figuren mit annehmbarem Auftrag (GetAcceptableRequestList) und die Auftragstafel; Laeden
+-- stehen unter "Händler" statt unter "Personen".
+menuInfo.GIVER_CATEGORY = "Auftraggeber"
+-- Wunsch User 16.11.: Figuren, deren aktuelles Gespraech Geschichte ist (menuInfo.npcStoryKind).
+menuInfo.STORY_TALK_CATEGORY = "Wichtige Gespräche"
+menuInfo.requestGiverTitles = {}
 
 menuInfo.GAME_WORDS = {
     Schatztruhe = "Schatztruhe", Speicherpunkt = "Speicherpunkt", Gasthaus = "Gasthaus", Kolosseum = "Kolosseum",
@@ -2358,7 +2461,9 @@ local function questTargetKeys()
         FindFirstOf("CPP_MiniMapSubsystem").EntryDataMap:ForEach(function(_, value)
             local entry = value:get()
             if entry.bIsMarkedQuestTarget then
-                addKey(entry.ObjectData.TypeData)
+                local typeData = entry.ObjectData.TypeData
+                log("Minikarte markiert: " .. objectKey(typeData.Type, typeData.ID))
+                addKey(typeData)
             end
         end)
     end)
@@ -2369,6 +2474,9 @@ local function questTargetKeys()
     -- Ansage die Zielkarte.
     menuInfo.questElsewhere = nil
     menuInfo.questElsewhereIds = {}
+    -- Erledigte Punkte (Bedingung nicht mehr erfuellt, etwa !{flag:200} nach dem Gespraech in Dilmagia) fallen
+    -- auch aus den anderen Quellen heraus: Die Szenario-Liste fuehrt alle Objekte des Abschnitts ohne Bedingung.
+    local pending, done = {}, {}
     local questOk, questError = pcall(withCurrentQuest, function(quest)
         local currentGroup = menuInfo.mapGroup(menuInfo.defaultObject("CPP_BFL_Map"):GetCurrentMapId())
         quest.DestinationList:ForEach(function(_, element)
@@ -2376,11 +2484,18 @@ local function questTargetKeys()
             local mapId = point.DestinationKey.DestinationId
             local isMap = point.DestinationKey.Type == 0
             local onThisMap = isMap and menuInfo.mapGroup(mapId) == currentGroup
+            local met = conditionMet(point.Condition)
             log("Questpunkt: Typ " .. tostring(point.PointType) .. ", Objekt " .. tostring(point.IsPointToObject)
                 .. " " .. objectKey(point.Object.Type, point.Object.ID) .. ", Karte " .. tostring(mapId)
-                .. ", hier " .. tostring(onThisMap))
-            if onThisMap and point.IsPointToObject and conditionMet(point.Condition) then
-                addKey(point.Object)
+                .. ", hier " .. tostring(onThisMap) .. ", erfuellt " .. tostring(met))
+            if onThisMap and point.IsPointToObject then
+                local key = objectKey(point.Object.Type, point.Object.ID)
+                if met then
+                    pending[key] = true
+                    addKey(point.Object)
+                else
+                    done[key] = true
+                end
             elseif isMap and not onThisMap then
                 menuInfo.questElsewhere = mapNameById(mapId)
                 menuInfo.questElsewhereIds[mapId] = true
@@ -2392,10 +2507,17 @@ local function questTargetKeys()
     end
     -- Was das Spiel fuer die Hauptgeschichte auf dieser Karte fuehrt, und die Karten, die es als aktuelle Ziele
     -- kennt (Zwischenhalte); Ausgaenge dorthin zaehlen als Questziel.
+    -- Die Szenario-Liste fuehrt alle Objekte des Abschnitts, auch schon erledigte (Dilmagia: der aeltere Mann,
+    -- 1:12, bleibt drin, obwohl die Quest nur noch 1:15 und 1:17 nennt). Nennt die Quest hier eigene Punkte,
+    -- gelten nur diese; die Szenario-Liste springt nur ein, wenn die Quest fuer diese Karte nichts nennt.
+    local useScenario = next(pending) == nil
     local scenarioOk, scenarioError = pcall(function()
         menuInfo.eachValue(menuInfo.defaultObject("CPP_BFL_Scenario"):GetCurrentMainScenarioMapObjectList(), function(typeData)
-            log("Szenario-Objekt: " .. objectKey(typeData.Type, typeData.ID))
-            addKey(typeData)
+            local key = objectKey(typeData.Type, typeData.ID)
+            log("Szenario-Objekt: " .. key .. (useScenario and "" or (pending[key] and "" or ", uebergangen")))
+            if useScenario then
+                addKey(typeData)
+            end
         end)
     end)
     if not scenarioOk then
@@ -2414,6 +2536,12 @@ local function questTargetKeys()
     end)
     if not mapsOk then
         log("Zielkarten fehlgeschlagen: " .. tostring(mapsError))
+    end
+    for key in pairs(done) do
+        if not pending[key] and keys[key] then
+            keys[key] = nil
+            log("Questziel erledigt: " .. key)
+        end
     end
     for key in pairs(keys) do
         log("Questziel gesucht: " .. key)
@@ -2484,12 +2612,18 @@ scanTargets = function(categoryName, origin)
     if categoryName == menuInfo.SHRINE_CATEGORY then
         return menuInfo.shrineTargets(origin)
     end
+    if categoryName == menuInfo.ESPER_CATEGORY then
+        return menuInfo.esperTargets(origin)
+    end
     local targets = {}
     local seen = {}
     local questKeys = categoryName == QUEST_CATEGORY and questTargetKeys() or nil
     local sortsDoors = categoryName == "Ausgänge" or categoryName == "Türen"
     local exits = sortsDoors and exitNames() or {}
-    local requestGivers = (categoryName == "Personen" or questKeys) and menuInfo.requestGivers() or {}
+    local giverCategory = categoryName == menuInfo.GIVER_CATEGORY
+    local storyTalkCategory = categoryName == menuInfo.STORY_TALK_CATEGORY
+    local storyKinds = {}
+    local requestGivers = (categoryName == "Personen" or giverCategory or questKeys) and menuInfo.requestGivers() or {}
     local foundKeys = {}
     local sources = { table.unpack(TARGET_SOURCES) }
     if questKeys then
@@ -2511,7 +2645,7 @@ scanTargets = function(categoryName, origin)
                     local hasTarget = exits[path] or transitionPointName(actor)
                     info = { hasTarget and "Ausgänge" or "Türen", "Tür" }
                 end
-                local matches = false
+                local matches, questExit = false, false
                 if questKeys then
                     local key = isSelectable(actor) and questTargetKey(actor, questKeys, source[1])
                     if key then
@@ -2520,9 +2654,26 @@ scanTargets = function(categoryName, origin)
                     elseif source[1] == "CPP_MapTransitionTrigger" and isExitUsable(actor) then
                         local mapOk, mapId = pcall(menuInfo.exitTargetMap, actor)
                         matches = mapOk and menuInfo.questMaps[mapId] == true
+                        questExit = matches
+                    end
+                elseif giverCategory and source[1] == "CPP_MapUnit_NPC" and menuInfo.isRequestGiver(actor, requestGivers) then
+                    matches = isSelectable(actor)
+                elseif storyTalkCategory and source[1] == "CPP_MapUnit_NPC" then
+                    if isSelectable(actor) then
+                        local kind, eventId = menuInfo.npcStoryKind(actor)
+                        storyKinds[path] = kind
+                        matches = kind ~= nil
+                        if kind then
+                            log("Wichtiges Gespraech: " .. path .. " " .. tostring(eventId))
+                        end
                     end
                 elseif info and info[1] == categoryName then
                     matches = source[3] or isSelectable(actor)
+                    if matches and source[1] == "CPP_MapUnit_NPC" and not menuInfo.npcTalkable(actor, interactType) then
+                        matches = false
+                    elseif matches and path:find("DotObject", 1, true) and not menuInfo.hasActiveEvent(actor) then
+                        matches = false
+                    end
                     if matches and source[1] == "CPP_MapTransitionTrigger" then
                         matches = isExitUsable(actor)
                     elseif matches and (source[1] == "CPP_MapGimmick_InteractEventTrigger"
@@ -2540,8 +2691,12 @@ scanTargets = function(categoryName, origin)
                     if questKeys and source[1] == "CPP_MapTransitionTrigger" then
                         label = exitTargetName(actor, {}) or label
                     end
+                    if storyKinds[path] then
+                        label = label .. ", " .. storyKinds[path]
+                    end
                     if source[1] == "CPP_MapUnit_NPC" and menuInfo.isRequestGiver(actor, requestGivers) then
-                        label = label .. ", Auftrag"
+                        local title = giverCategory and menuInfo.requestGiverTitles[actor.m_UniqueId]
+                        label = label .. ", " .. (title and ("Auftrag " .. title) or "Auftrag")
                     end
                     -- Kartensymbole sind nur der markierte Ort, ihr Interaktionstyp sagt nichts ueber das Ziel.
                     if questKeys and path:find("MapIconPoint", 1, true) then
@@ -2553,8 +2708,20 @@ scanTargets = function(categoryName, origin)
                         label = label,
                         location = { X = location.X, Y = location.Y, Z = location.Z },
                         distance = distance2D(location, origin),
+                        questExit = questExit or nil,
                     })
                 end
+            end
+        end
+    end
+    -- Liegen Questziele auf dieser Karte, fuehren die Ausgaenge zu anderen Zielkarten nur weg: In der
+    -- Schiffswerft nannte das Spiel auch Dilmagia, die Questreise lief zum naechsten Eintrag, dem Ausgang
+    -- zurueck, und pendelte zwischen beiden Karten.
+    if questKeys and next(foundKeys) then
+        for index = #targets, 1, -1 do
+            if targets[index].questExit then
+                log("Questziel-Ausgang uebergangen: " .. targets[index].label)
+                table.remove(targets, index)
             end
         end
     end
@@ -2599,6 +2766,13 @@ scanTargets = function(categoryName, origin)
         -- Auch keine Ereignisse mehr: im Dungeon fuehrt der Ausgang in den naechsten Teil weiter (Werft 21:26,
         -- nach dem Speicherpunkt war die Liste leer, weiter ging es ueber den Ausgang nach 3061).
         return menuInfo.deeperExits(origin)
+    end
+    if giverCategory and #targets == 0 then
+        local ids = {}
+        for id, unitId in pairs(requestGivers) do
+            table.insert(ids, tostring(id) .. "/" .. tostring(unitId))
+        end
+        log("Auftraggeber: keiner gefunden, erwartet " .. (#ids > 0 and table.concat(ids, ", ") or "niemand auf dieser Karte"))
     end
     table.sort(targets, function(a, b)
         return a.distance < b.distance
@@ -2964,6 +3138,105 @@ function menuInfo.shrineTargets(origin, wanted)
     return result
 end
 
+-- Esper (Wunsch User 16.11.): Wohnstaetten, die Leute im Gespraech verraten ("Der Standort einer Esper-Wohnstaette
+-- wurde zur Karte hinzugefuegt!"). Spieldaten Wld_GD: BP_DestAreaBox_C mit interactType MythicalBeast; die
+-- VisibleCondition ist die Bedingung der Kartenmarkierung (Geruecht gehoert, Esper noch nicht geholt). Nur diese
+-- Bereiche zaehlen, also nur, was auch auf der Karte des Spielers eingezeichnet ist. Die Tabelle dient abseits der
+-- Weltkarte (dort sind die Bereiche nicht geladen) und fuer den Namen; Odin und Bahamut haben keinen Kartenbereich.
+menuInfo.ESPER_CATEGORY = "Esper"
+menuInfo.ESPER_INTERACT_TYPE = 12 -- eMapInteractType::MythicalBeast
+menuInfo.ESPERS = {
+    { name = "Ramuh", show = "{progress:12}==10" },
+    { name = "Titan", show = "{progress:13}==10" },
+    { name = "Ifrit", show = "{progress:18}==10" },
+    { name = "Shiva", show = "{progress:20}==10" },
+    { name = "Karfunkel", show = "{flag:326}&{progress:45}!=50" },
+}
+
+function menuInfo.esperByCondition(condition)
+    for _, entry in ipairs(menuInfo.ESPERS) do
+        if entry.show == condition then
+            return entry
+        end
+    end
+    return nil
+end
+
+-- Eingezeichnete Esper laut Spielzustand (auch abseits der Weltkarte).
+function menuInfo.markedEspers()
+    local result = {}
+    for _, entry in ipairs(menuInfo.ESPERS) do
+        if menuInfo.conditionString(entry.show) == true then
+            table.insert(result, entry)
+        end
+    end
+    return result
+end
+
+local function esperLabel(entry)
+    return entry and ("Esper-Wohnstätte " .. entry.name) or "Esper-Wohnstätte"
+end
+
+-- Ziele der Kategorie Esper; wanted (Esper-Reise) beschraenkt auf eine Esper.
+-- Weltkarte: die eingezeichneten Bereiche. Anderswo: Ausgaenge Richtung Weltkarte, wenn etwas eingezeichnet ist.
+function menuInfo.esperTargets(origin, wanted)
+    local result = {}
+    if menuInfo.currentMapId() == menuInfo.WORLD_MAP_ID then
+        for _, box in ipairs(FindAllOf("CPP_DestAreaBox") or {}) do
+            if box:IsValid() and interactTypeOf(box) == menuInfo.ESPER_INTERACT_TYPE then
+                local condOk, condition = pcall(function()
+                    return box.VisibleCondition:ToString()
+                end)
+                condition = condOk and condition or ""
+                local entry = menuInfo.esperByCondition(condition)
+                local shown = condition ~= "" and menuInfo.conditionString(condition) == true
+                log("Esper-Bereich " .. objectPath(box) .. ": " .. condition .. " " .. tostring(shown))
+                if shown and (not wanted or wanted == entry) then
+                    local location = box:K2_GetActorLocation()
+                    table.insert(result, {
+                        actor = box,
+                        path = objectPath(box),
+                        label = esperLabel(entry),
+                        esper = entry or { name = "?" },
+                        location = { X = location.X, Y = location.Y, Z = location.Z },
+                        distance = distance2D(location, origin),
+                    })
+                end
+            end
+        end
+        table.sort(result, function(a, b)
+            return a.distance < b.distance
+        end)
+        return result
+    end
+    local marked = wanted and { wanted } or menuInfo.markedEspers()
+    if #marked == 0 then
+        return result
+    end
+    local names = {}
+    for _, entry in ipairs(marked) do
+        table.insert(names, entry.name)
+    end
+    local exits = menuInfo.exitsToward(menuInfo.WORLD_MAP_ID)
+    for _, trigger in ipairs(exits) do
+        local location = menuInfo.interactPoint(trigger)
+        local name = exitTargetName(trigger, {}) or menuInfo.displayLabel("Ausgang", trigger, 3)
+        table.insert(result, {
+            actor = trigger,
+            path = objectPath(trigger),
+            label = name .. ", Weg zur Esper " .. table.concat(names, ", "),
+            away = marked[1],
+            location = { X = location.X, Y = location.Y, Z = location.Z },
+            distance = distance2D(location, origin),
+        })
+    end
+    log("Esper: " .. #result .. " Ausgaenge Richtung Weltkarte fuer " .. table.concat(names, ", "))
+    table.sort(result, function(a, b)
+        return a.distance < b.distance
+    end)
+    return result
+end
+
 -- Kategorie Auftraege: Ziele auf dieser Karte direkt, sonst der Ausgang, der am schnellsten zur Zielkarte fuehrt.
 function menuInfo.requestTargets(origin)
     local byPath, targets = {}, {}
@@ -3181,7 +3454,13 @@ function navGrid.cellOf(value)
     return math.floor(value / navGrid.CELL + 0.5)
 end
 
+-- Beim Abtasten fassen 150-cm-Stufen doppelte Bodentreffer zusammen. Fertige Karten aus dem Navmesh haben je Punkt
+-- eine eindeutige Hoehe: Dort verschmolz die Stufe Rampe und Boden darunter (Zwergenschmiede 16.11., Rampe zu Borin
+-- bei 8175..8400 -2550..-2850, 7 Punkte), die spaetere Zeile ueberschrieb die Verbindungen, Borin galt als unerreichbar.
 function navGrid.nodeKey(ix, iy, z)
+    if navGrid.exactHeights then
+        return ix .. ":" .. iy .. ":" .. math.floor(z + 0.5)
+    end
     return ix .. ":" .. iy .. ":" .. math.floor(z / 150 + 0.5)
 end
 
@@ -3443,6 +3722,7 @@ function navGrid.loadPrebuilt(level)
     end
     local rows = {}
     navGrid.liftStops = {}
+    navGrid.exactHeights = true
     for line in file:lines() do
         -- Aufzughalte aus den Spieldaten: "A <Level>:<Objekt> <Index> x y z" (Index wie m_CallFloorIndex).
         local liftKey, stopIndex, stopX, stopY, stopZ = line:match("^A (%S+) (%d+) (%S+) (%S+) (%S+)$")
@@ -3489,7 +3769,9 @@ function navGrid.reset(level, useFile)
     navGrid.liftStops = nil
     navGrid.generation = navGrid.generation + 1
     navGrid.gateLogCount = 0
+    navGrid.exactHeights = false
     navGrid.prebuilt = useFile and navGrid.loadPrebuilt(level)
+    navGrid.exactHeights = navGrid.prebuilt and true or false
     if navGrid.prebuilt then
         navGrid.fromFile, navGrid.complete, navGrid.announceFinish = false, true, false
         navGrid.scannedThisSession[level] = true
@@ -3934,6 +4216,24 @@ function navGrid.chooseGoal(previous, destination, actor, noPartial)
     end
     if best then
         return best, false
+    end
+    -- Diagnose (Zwergenschmiede 16.11.: Borin steht auf einer erreichbaren Ebene 1,9 m ueber dem Boden, die Figur
+    -- blieb trotzdem 12 m davor stehen; Ziel kam vermutlich aus goalInsideBounds).
+    if not noPartial then
+        local near, reachable, nearestHeight = 0, 0, math.huge
+        for ix = baseX - range, baseX + range do
+            for iy = baseY - range, baseY + range do
+                for _, node in ipairs(navGrid.cells[ix .. ":" .. iy] or {}) do
+                    near = near + 1
+                    if previous[node] then
+                        reachable = reachable + 1
+                        nearestHeight = math.min(nearestHeight, math.abs(node.Z - destination.Z))
+                    end
+                end
+            end
+        end
+        log(string.format("Zielpunkt nicht direkt: %d Punkte um %.0f %.0f %.0f, erreichbar %d, kleinster Hoehenabstand %s",
+            near, destination.X, destination.Y, destination.Z, reachable, tostring(nearestHeight)))
     end
     -- Aufzuege nicht: ihre Bounds umfassen den ganzen Schacht, ein Punkt auf einer Zwischenebene ist nicht die
     -- Plattform (Windschrein 08.11.: Aufzug C_3 21 m tiefer galt als erreichbar).
@@ -4561,7 +4861,7 @@ function navRoute.filterReachable(pawn, origin, targets, categoryName, keepAll)
         target.doorHops = verdict.doorHops or target.doorHops
         -- Markierte Ziele bleiben auch ohne bekannten Weg waehlbar, mit Richtung und Entfernung.
         if not keep and (categoryName == QUEST_CATEGORY or categoryName == menuInfo.REQUEST_CATEGORY
-                or categoryName == menuInfo.SHRINE_CATEGORY) then
+                or categoryName == menuInfo.SHRINE_CATEGORY or categoryName == menuInfo.ESPER_CATEGORY) then
             log("Questziel ohne bekannten Weg: " .. target.label .. " " .. target.path)
             keep = true
         end
@@ -5769,6 +6069,12 @@ local function selectTarget(steps)
                 or ("Noch " .. open .. " Visionen offen.")), true)
             return
         end
+        if categoryName == menuInfo.ESPER_CATEGORY then
+            local marked = #menuInfo.markedEspers()
+            speak(categoryName .. (marked == 0 and ", keine Wohnstätte auf der Karte eingezeichnet."
+                or ", hier kein Weg bekannt. Eingezeichnet: " .. marked .. "."), true)
+            return
+        end
         speak(categoryName .. (#allTargets > 0 and ", nichts erreichbar." or ", nichts gefunden."), true)
         return
     end
@@ -5921,9 +6227,14 @@ end
 -- Neu geplant wird nur bei Start, nach gesperrter Eingabe (Szene, Kampf, Menue, Laden) und nach Kartenwechsel,
 -- damit die Figur am Ziel stehen bleibt, bis man selbst Enter drueckt.
 -- Bei Auftraegen folgt die Reise den Auftraegen des gewaehlten Eintrags (questIds) ueber alle Karten.
-function navRoute.startJourney(questIds, shrine)
+function navRoute.startJourney(questIds, shrine, esper)
     navRoute.journey = { pending = true, level = navGrid.level, calmSince = os.clock() - navRoute.JOURNEY_CALM_SECONDS,
-        questIds = questIds, shrine = shrine }
+        questIds = questIds, shrine = shrine, esper = esper }
+    if esper then
+        log("Esper-Reise gestartet: " .. esper.name)
+        speak("Weg zur Esper gestartet, " .. esper.name .. ".", true)
+        return
+    end
     log(shrine and ("Heiligtum-Reise gestartet: " .. shrine.first) or "Questreise gestartet")
     speak(shrine and ("Weg zum Heiligtum gestartet, " .. menuInfo.shrineName(shrine) .. ".") or "Questreise gestartet.", true)
 end
@@ -5963,6 +6274,37 @@ function navRoute.planShrineLeg(pawn, origin)
     end
     selectedTargetPath = target.path
     log("Heiligtum-Reise: " .. target.label .. " " .. target.path)
+    navRoute.startWalk()
+end
+
+-- Esper-Reise: Ausgang Richtung Weltkarte, dort der eingezeichnete Bereich. Ist die Markierung weg (Esper geholt),
+-- endet die Reise; am Bereich bleibt die Figur stehen, Enter drueckt man selbst.
+function navRoute.planEsperLeg(pawn, origin)
+    local journey = navRoute.journey
+    local targets = navRoute.filterReachable(pawn, origin, menuInfo.esperTargets(origin, journey.esper),
+        menuInfo.ESPER_CATEGORY, true)
+    local target = targets[1]
+    if not target then
+        navRoute.journey = nil
+        log("Esper-Reise: kein Schritt auf Karte " .. tostring(menuInfo.currentMapId()))
+        speak(menuInfo.conditionString(journey.esper.show) == false
+            and ("Esper " .. journey.esper.name .. " ist nicht mehr eingezeichnet. Weg zur Esper beendet.")
+            or "Weg zur Esper: hier ist kein nächster Schritt bekannt. Beendet.", true)
+        return
+    end
+    if target.esper and (target.distance < navRoute.JOURNEY_NEAR_DISTANCE
+            or (target.path == journey.arrivedPath and journey.arrivedLevel == navGrid.level)) then
+        navRoute.journey = nil
+        log("Esper-Reise: am Ziel " .. target.label)
+        return
+    end
+    for index, name in ipairs(TARGET_CATEGORIES) do
+        if name == menuInfo.ESPER_CATEGORY then
+            selectedCategory = index
+        end
+    end
+    selectedTargetPath = target.path
+    log("Esper-Reise: " .. target.label .. " " .. target.path)
     navRoute.startWalk()
 end
 
@@ -6082,6 +6424,9 @@ function navRoute.planJourneyLeg(pawn)
     local origin = pawn:K2_GetActorLocation()
     if journey.shrine then
         return navRoute.planShrineLeg(pawn, origin)
+    end
+    if journey.esper then
+        return navRoute.planEsperLeg(pawn, origin)
     end
     local categoryName = journey.questIds and menuInfo.REQUEST_CATEGORY or QUEST_CATEGORY
     local target = navRoute.journeyPick(pawn, origin, categoryName, journey.questIds and function(candidate)
@@ -6225,6 +6570,31 @@ local function toggleWalk()
         local shrine = chosen.shrine or chosen.away
         if shrine and not chosen.leave then
             navRoute.startJourney(nil, shrine)
+            return
+        end
+    end
+    -- Esper: Pos1 fuehrt ueber alle Karten bis zum eingezeichneten Bereich der gewaehlten Esper.
+    if categoryName == menuInfo.ESPER_CATEGORY then
+        if navRoute.journey and navRoute.journey.esper then
+            navRoute.journey = nil
+            log("Esper-Reise beendet")
+            speak("Weg zur Esper beendet.", true)
+            return
+        end
+        local pawn = playerUnit()
+        local chosen = nil
+        for _, candidate in ipairs(pawn and navRoute.targetsFor(categoryName, pawn:K2_GetActorLocation()) or {}) do
+            if candidate.path == selectedTargetPath then
+                chosen = candidate
+            end
+        end
+        if not chosen then
+            speak("Kein Ziel ausgewählt.", true)
+            return
+        end
+        local esper = chosen.away or chosen.esper
+        if esper and esper.show then
+            navRoute.startJourney(nil, nil, esper)
             return
         end
     end
@@ -7233,10 +7603,145 @@ end
 end
 defineBattleAndQuest()
 
+-- Schnellreise auf der Weltkarte (Wunsch User 16.11.): Bild hoch/runter springt den Zeiger ueber
+-- CPP_VM_WldMap:JumpToObject zum vorigen/naechsten Ort, Enter fragt dann wie gewohnt "<Ort> besuchen?".
+-- Orte sind die Eintraege CPP_VM_WldMapEntry (verfuegbar, anwaehlbar, mit Karte), unbesuchte Karten fallen weg,
+-- wenn das Spiel sie nicht erlaubt (bEnableFastTravelUnvisitedMap). Ob FastTravelBehavior.bCanTravel schon nach
+-- dem Sprung stimmt, ist ungeprueft: nur Log, kein Filter.
+function menuInfo.worldMapViewModel()
+    local fallback
+    for _, viewModel in ipairs(FindAllOf("CPP_VM_WldMap") or {}) do
+        if viewModel:IsValid() and not objectPath(viewModel):find("Default__", 1, true) then
+            if shortClassName(viewModel) == "VM_WldMap_C" then
+                return viewModel
+            end
+            fallback = fallback or viewModel
+        end
+    end
+    return fallback
+end
+
+function menuInfo.fastTravelTargets(viewModel)
+    local allowUnvisited = false
+    pcall(function()
+        allowUnvisited = viewModel.WldMapDA.bEnableFastTravelUnvisitedMap == true
+    end)
+    local saveData = menuInfo.defaultObject("CPP_BFL_SaveData_PerMap")
+    local targets, seen, skipped = {}, {}, {}
+    for _, entry in ipairs(FindAllOf("CPP_VM_WldMapEntry") or {}) do
+        if entry:IsValid() and not objectPath(entry):find("Default__", 1, true) then
+            local ok, objectId, mapId = pcall(function()
+                return entry.ObjectId, entry.FldObjData.RelatedMapId
+            end)
+            local name = ok and mapNameById(mapId)
+            local reason
+            if not ok or type(objectId) ~= "number" then
+                reason = "ohne ID"
+            elseif not name then
+                reason = "ohne Karte " .. tostring(mapId)
+            elseif menuInfo.call(entry, "IsAvailable") == false then
+                reason = "nicht verfuegbar"
+            elseif menuInfo.call(entry, "IsFocusable") == false then
+                reason = "nicht anwaehlbar"
+            elseif not allowUnvisited and saveData and menuInfo.call(saveData, "IsVisited", mapId) == false then
+                reason = "nicht besucht"
+            elseif seen[name] then
+                reason = "doppelt"
+            end
+            if reason then
+                table.insert(skipped, tostring(name or mapId) .. " (" .. reason .. ")")
+            else
+                seen[name] = true
+                table.insert(targets, { objectId = objectId, mapId = mapId, name = name })
+            end
+        end
+    end
+    table.sort(targets, function(a, b)
+        return a.name < b.name
+    end)
+    log("Schnellreise: " .. #targets .. " Orte, ausgelassen: " .. table.concat(skipped, ", "))
+    return targets
+end
+
+function menuInfo.stepFastTravel(steps)
+    local viewModel = menuInfo.worldMapViewModel()
+    if not viewModel then
+        log("Schnellreise: CPP_VM_WldMap nicht gefunden")
+        speak("Weltkarte nicht bereit", true)
+        return
+    end
+    local targets = menuInfo.fastTravelTargets(viewModel)
+    if #targets == 0 then
+        speak("Keine Schnellreiseziele", true)
+        return
+    end
+    -- Die Liste wird jedes Mal neu gelesen, die Stelle haengt am Namen.
+    local index
+    for position, target in ipairs(targets) do
+        if menuInfo.fastTravelIndex and target.name == menuInfo.fastTravelIndex then
+            index = position
+        end
+    end
+    if index then
+        index = (index - 1 + steps) % #targets + 1
+    else
+        index = steps > 0 and 1 or #targets
+    end
+    local target = targets[index]
+    menuInfo.fastTravelIndex = target.name
+    local ok, err = pcall(function()
+        viewModel:JumpToObject(target.objectId)
+    end)
+    log("Schnellreise: Sprung zu " .. target.name .. " (Objekt " .. target.objectId .. ", Karte " .. target.mapId
+        .. ")" .. (ok and "" or (" fehlgeschlagen: " .. tostring(err))))
+    if not ok then
+        speak(target.name .. ", Sprung fehlgeschlagen", true)
+        return
+    end
+    -- Die Ortsansage des Spiels (tickWorldMap) bekommt die Stelle angehaengt; kommt sie nicht, sagt es der Rueckfall.
+    menuInfo.fastTravelJump = {
+        name = target.name,
+        position = index .. " von " .. #targets,
+        due = os.clock() + 1.5,
+        checkAt = os.clock() + 0.5,
+        viewModel = viewModel,
+    }
+    if menuInfo.worldMapSpoken then
+        menuInfo.worldMapSpoken["WBP_WM_LandmarkQuestInfo"] = nil
+    end
+end
+
+function menuInfo.tickFastTravelJump()
+    local jump = menuInfo.fastTravelJump
+    if not jump then
+        return
+    end
+    local now = os.clock()
+    if jump.checkAt and now >= jump.checkAt then
+        jump.checkAt = nil
+        local ok, canTravel, focus = pcall(function()
+            return jump.viewModel.FastTravelBehavior.bCanTravel, jump.viewModel.FocusObjectId
+        end)
+        log("Schnellreise: " .. jump.name .. " bCanTravel " .. tostring(ok and canTravel) .. ", Fokus "
+            .. tostring(ok and focus))
+    end
+    if now >= jump.due then
+        menuInfo.fastTravelJump = nil
+        speak(jump.name .. ", " .. jump.position, true)
+    end
+end
+
 -- Mit Umschalt melden sich unter Umstaenden beide Tastenbelegungen, die Kategorie hat Vorrang.
 local function tickPathfinderKeys()
     local categorySteps, targetSteps, walkToggle = pendingCategorySteps, pendingTargetSteps, pendingWalkToggle
     pendingCategorySteps, pendingTargetSteps, pendingWalkToggle = 0, 0, false
+    local worldMap = menuInfo.worldMapLayout
+    if worldMap and worldMap:IsValid() and worldMap:IsActivated() then
+        if targetSteps ~= 0 and categorySteps == 0 then
+            menuInfo.stepFastTravel(targetSteps)
+        end
+        return
+    end
     if categorySteps ~= 0 then
         stepCategory(categorySteps)
     elseif targetSteps ~= 0 then

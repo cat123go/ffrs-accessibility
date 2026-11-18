@@ -7,8 +7,25 @@ $ErrorActionPreference = 'Stop'
 $target = Join-Path $GameDir 'FFRS\Binaries\Win64\ue4ss\Mods\FFRSAccess'
 New-Item -ItemType Directory -Force "$target\Scripts", "$target\bin" | Out-Null
 
-Copy-Item "$PSScriptRoot\mod\FFRSAccess\Scripts\main.lua", "$PSScriptRoot\mod\FFRSAccess\Scripts\karte_*.txt", "$PSScriptRoot\mod\FFRSAccess\Scripts\namen_spiel.txt", "$PSScriptRoot\mod\FFRSAccess\Scripts\namen_gelernt.txt" "$target\Scripts\" -Force
+Copy-Item "$PSScriptRoot\mod\FFRSAccess\Scripts\main.lua", "$PSScriptRoot\mod\FFRSAccess\Scripts\narration.lua", "$PSScriptRoot\mod\FFRSAccess\Scripts\sounds.lua","$PSScriptRoot\mod\FFRSAccess\Scripts\karte_*.txt", "$PSScriptRoot\mod\FFRSAccess\Scripts\namen_spiel.txt", "$PSScriptRoot\mod\FFRSAccess\Scripts\namen_gelernt.txt" "$target\Scripts\" -Force
 Copy-Item "$PSScriptRoot\build\ffrs_speech.dll", "$PSScriptRoot\build\prism.dll" "$target\bin\" -Force -ErrorAction Continue
+# Audiodeskription (Texte und Aufnahmen aus Visions of Grandshelt, GPL-3): nur kopieren, was sich geaendert hat.
+$descriptions = "$PSScriptRoot\mod\FFRSAccess\Descriptions"
+if (Test-Path $descriptions) {
+    robocopy $descriptions "$target\Descriptions" /E /XO /NFL /NDL /NJH /NJS /NP | Out-Null
+    if ($LASTEXITCODE -ge 8) { throw "Kopieren der Audiodeskription fehlgeschlagen ($LASTEXITCODE)" }
+    $global:LASTEXITCODE = 0
+}
+# Raumklaenge (mit genny erzeugt, Sounds\klaenge.json).
+New-Item -ItemType Directory -Force "$target\Sounds" | Out-Null
+Copy-Item "$PSScriptRoot\mod\FFRSAccess\Sounds\*.wav" "$target\Sounds\" -Force
+# Entwicklerstand: Strg+F9 laedt die Mods neu (UE4SS: HotReloadKey mit Strg). Das Paket schaltet es ab.
+$settingsPath = Join-Path $GameDir 'FFRS\Binaries\Win64\ue4ss\UE4SS-settings.ini'
+if (Test-Path $settingsPath) {
+    $settings = Get-Content $settingsPath
+    $settings = $settings -replace '^EnableHotReloadSystem\s*=.*$', 'EnableHotReloadSystem = 1' -replace '^HotReloadKey\s*=.*$', 'HotReloadKey = F9'
+    Set-Content -Path $settingsPath -Value $settings -Encoding Ascii
+}
 # Die Mod sagt beim Laden die Version an; die Datei schreibt sonst nur der Paketbau.
 Set-Content -Path "$target\version.txt" -Value (Get-Content "$PSScriptRoot\VERSION" -TotalCount 1).Trim() -Encoding Ascii
 # UE4SS startet Mods mit dieser Markierungsdatei, ohne dass mods.txt geaendert werden muss.

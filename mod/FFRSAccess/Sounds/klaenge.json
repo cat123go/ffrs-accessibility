@@ -1,0 +1,71 @@
+{
+  "out_dir": ".",
+  "normalize": -3.0,
+  "sounds": [
+    {"out": "wand.wav", "loop": 0.2, "duration": 2.0, "trim": false,
+     "layers": [
+       {"type": "sfx", "kind": "tone", "params": {"freq": 440, "dur": 2.2, "wave": "sine"}},
+       {"type": "sfx", "kind": "tone", "params": {"freq": 880, "dur": 2.2, "wave": "triangle"}, "gain": 0.12}
+     ],
+     "fx": [{"type": "lowpass", "cutoff": 1800}, {"type": "mono"}]},
+
+    {"out": "ziel.wav", "duration": 0.45, "trim": false, "loop": false,
+     "layers": [
+       {"type": "drum", "kind": "woodblock", "vel": 0.8},
+       {"type": "sfx", "kind": "noise", "params": {"dur": 0.03, "color": "white"}, "gain": 0.25,
+        "fx": [{"type": "bandpass", "center": 3000, "q": 1.5}]}
+     ],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "ausgang_ziel.wav", "duration": 0.5, "trim": false, "loop": false,
+     "layers": [
+       {"type": "sfx", "kind": "whoosh", "params": {"dur": 0.32, "low": 400, "high": 3500, "direction": "up"}},
+       {"type": "drum", "kind": "woodblock", "vel": 0.35, "at": 0.25}
+     ],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "ausgang.wav", "loop": 0.3, "duration": 4.0, "trim": false,
+     "layers": [{"type": "sfx", "kind": "wind_howl", "params": {"dur": 4.4, "gust": 0.4}}],
+     "fx": [{"type": "highpass", "cutoff": 250}, {"type": "mono"}]},
+
+    {"out": "person.wav", "loop": 0.3, "duration": 3.0, "trim": false,
+     "layers": [{"type": "sfx", "kind": "crowd", "params": {"mood": "murmur", "size": 0.05, "dur": 3.4}}],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "tuer.wav", "duration": 1.2, "trim": false, "loop": false,
+     "layers": [{"type": "sfx", "kind": "knock", "params": {"count": 2, "surface": "wood", "force": 0.5}}],
+     "fx": [{"type": "reverb", "mix": 0.12, "size": 0.3}, {"type": "mono"}]},
+
+    {"out": "schalter.wav", "duration": 1.0, "trim": false, "loop": false,
+     "layers": [
+       {"type": "sfx", "kind": "switch", "params": {"state": "on"}},
+       {"type": "sfx", "kind": "solenoid", "params": {"size": 0.3, "metal": 0.6, "thump": 0.3}, "at": 0.12, "gain": 0.5}
+     ],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "truhe.wav", "duration": 1.1, "trim": false, "loop": false,
+     "layers": [
+       {"type": "sfx", "kind": "keys", "params": {"dur": 0.4, "shakes": 2}},
+       {"type": "sfx", "kind": "creak", "params": {"dur": 0.3, "pitch": 1.3}, "gain": 0.35, "at": 0.35}
+     ],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "gegenstand.wav", "duration": 1.0, "trim": false, "loop": false,
+     "layers": [{"type": "sfx", "kind": "magic", "params": {"dur": 0.45, "density": 8, "freq": "C6"}, "gain": 0.7}],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "objekt.wav", "duration": 1.1, "trim": false, "loop": false,
+     "layers": [
+       {"type": "sfx", "kind": "paper", "params": {"action": "turn"}, "gain": 0.8},
+       {"type": "sfx", "kind": "steel_ball", "params": {"surface": "wood", "force": 0.4}, "at": 0.3, "gain": 0.6}
+     ],
+     "fx": [{"type": "mono"}]},
+
+    {"out": "speicherpunkt.wav", "loop": 0.3, "duration": 3.0, "trim": false,
+     "layers": [
+       {"type": "synth", "inst": "singing_bowl", "notes": "E5", "dur": 3.4, "vel": 0.5},
+       {"type": "sfx", "kind": "magic", "params": {"dur": 3.0, "density": 3, "freq": "E6"}, "gain": 0.25}
+     ],
+     "fx": [{"type": "mono"}]}
+  ]
+}

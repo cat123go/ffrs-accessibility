@@ -1521,7 +1521,11 @@ local function tickTalkWindows()
     end
     if current and current == pendingTalkText and current ~= spokenTalkText then
         spokenTalkText = current
-        speak(current, true)
+        -- Laeuft eine Audiodeskription, spricht narration.lua die Zeile erst danach.
+        local deferred = menuInfo.narration and menuInfo.narration.talkLine(current)
+        if not deferred then
+            speak(current, true)
+        end
         if onTalkLine then
             onTalkLine(current, currentWindow)
         end
@@ -1637,13 +1641,103 @@ function menuInfo.modVersion()
     return version ~= "" and ("Version " .. version .. " ") or ""
 end
 
-if startBridge() then
+-- Nach dem Neuladen (Strg+F9) haelt die DLL die alte Verbindung noch einen Moment: dann einige Male nachfassen.
+menuInfo.PIPE_RETRY_SECONDS = 5
+menuInfo.pipeRetryUntil = nil
+menuInfo.onPipeReady = {}
+
+function menuInfo.openPipe()
     local pipe, err = io.open(PIPE_PATH, "wb")
-    if pipe then
-        speechPipe = pipe
-        speak("Final Fantasy Resonance Zugang " .. menuInfo.modVersion() .. "geladen.", false)
-    else
+    if not pipe then
+        return false, err
+    end
+    speechPipe = pipe
+    speak("Final Fantasy Resonance Zugang " .. menuInfo.modVersion() .. "geladen.", false)
+    for _, callback in ipairs(menuInfo.onPipeReady) do
+        pcall(callback)
+    end
+    return true
+end
+
+function menuInfo.tickPipe()
+    if speechPipe or not menuInfo.pipeRetryUntil then
+        return
+    end
+    local ok, err = menuInfo.openPipe()
+    if ok then
+        menuInfo.pipeRetryUntil = nil
+    elseif os.clock() > menuInfo.pipeRetryUntil then
+        menuInfo.pipeRetryUntil = nil
         log("Pipe nicht geoeffnet: " .. tostring(err))
+    end
+end
+
+menuInfo.bridgeStarted = startBridge()
+
+-- Audiodeskription (narration.lua, Daten in ..\Descriptions).
+do
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local scriptsDir = info and info.source and info.source:match("^@(.*[\\/])")
+    local ok, module = pcall(dofile, (scriptsDir or "") .. "narration.lua")
+    if ok and type(module) == "table" then
+        menuInfo.narration = module
+        local started, err = pcall(module.init, {
+            log = log,
+            speak = speak,
+            objectPath = objectPath,
+            descriptionsDir = (scriptsDir or "") .. "..\\Descriptions\\",
+            sendLine = function(line)
+                if speechPipe then
+                    pcall(function()
+                        speechPipe:write(line .. "\n")
+                        speechPipe:flush()
+                    end)
+                end
+            end,
+        })
+        if not started then
+            menuInfo.narration = nil
+            log("Audiodeskription nicht gestartet: " .. tostring(err))
+        end
+    else
+        log("narration.lua nicht geladen: " .. tostring(module))
+    end
+end
+
+-- Raumklaenge (sounds.lua, Klaenge in ..\Sounds): erst laden, wenn die Pipe offen ist.
+do
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local scriptsDir = info and info.source and info.source:match("^@(.*[\\/])")
+    local ok, module = pcall(dofile, (scriptsDir or "") .. "sounds.lua")
+    if ok and type(module) == "table" then
+        table.insert(menuInfo.onPipeReady, function()
+            module.init({
+                log = log,
+                soundsDir = (scriptsDir or "") .. "..\\Sounds\\",
+                sendLine = function(line)
+                    if speechPipe then
+                        pcall(function()
+                            speechPipe:write(line .. "\n")
+                            speechPipe:flush()
+                        end)
+                    end
+                end,
+            })
+            menuInfo.sounds = module
+            if menuInfo.settings then
+                menuInfo.settings.apply()
+            end
+        end)
+    else
+        log("sounds.lua nicht geladen: " .. tostring(module))
+    end
+end
+
+if menuInfo.bridgeStarted then
+    local ok, err = menuInfo.openPipe()
+    if not ok then
+        log("Pipe noch nicht offen, versuche es weiter: " .. tostring(err))
+        menuInfo.pipeRetryUntil = os.clock() + menuInfo.PIPE_RETRY_SECONDS
     end
 end
 
@@ -2110,6 +2204,31 @@ function menuInfo.hasActiveEvent(actor)
         end)
     end)
     return active
+end
+
+-- Objekte mit eigener Funktion (Mechanismus, Fahrzeug, Schiff, Briefkasten): Ereignisse daran sind nur Beiwerk.
+menuInfo.SELF_ACTING_TYPES = { [8] = true, [14] = true, [15] = true, [27] = true }
+
+-- Nur Objekte, bei denen der Tastendruck etwas ausloest (Wunsch User 17.11.: Liste nannte Objekte ohne Aktion).
+-- Das Spiel blendet Objekte mit unerfuellter VisibleCondition aus; zum Untersuchen spielt es den ersten
+-- Eintrag aus m_EventList, dessen Bedingung erfuellt ist. Ist keiner erfuellt, passiert nichts.
+function menuInfo.objectUsable(actor, interactType)
+    local visibleOk, visibleCondition = pcall(function()
+        return actor.VisibleCondition
+    end)
+    if visibleOk and visibleCondition and not conditionMet(visibleCondition) then
+        return false, "unsichtbar"
+    end
+    if interactType and menuInfo.SELF_ACTING_TYPES[interactType] then
+        return true
+    end
+    local countOk, eventCount = pcall(function()
+        return actor.m_EventList:GetArrayNum()
+    end)
+    if countOk and type(eventCount) == "number" and eventCount > 0 and not menuInfo.hasActiveEvent(actor) then
+        return false, "kein aktives Ereignis"
+    end
+    return true
 end
 
 local function npcNamesPath()
@@ -2673,6 +2792,12 @@ scanTargets = function(categoryName, origin)
                         matches = false
                     elseif matches and path:find("DotObject", 1, true) and not menuInfo.hasActiveEvent(actor) then
                         matches = false
+                    elseif matches and categoryName == "Objekte" then
+                        local usable, reason = menuInfo.objectUsable(actor, interactType)
+                        if not usable then
+                            matches = false
+                            log("Objekt uebergangen (" .. reason .. "): " .. path)
+                        end
                     end
                     if matches and source[1] == "CPP_MapTransitionTrigger" then
                         matches = isExitUsable(actor)
@@ -4000,6 +4125,9 @@ navGrid.walls = {
         { -1, 0, 294, 0, "hinten" },
     },
     VOLUMES = { "1.4", "0.8", "0.45" },
+    -- Dauerton (Sounds\wand.wav, 440 Hz): Lautstaerke je Schritt bis zur Wand, Tonhoehe aus DIRECTIONS.
+    LOOP_GAINS = { 0.32, 0.16, 0.07 },
+    LOOP_BASE_HERTZ = 440,
     TONE_MS = 110,
     REPEAT_SECONDS = 1,
     RETRIGGER_SECONDS = 0.6,
@@ -4050,11 +4178,40 @@ function navGrid.tickWalls()
     local pawn = navGrid.pawn
     local usable = walls.enabled and not navGrid.disabled and pawn and pawn:IsValid() and pawn.m_IsEnableUnitInput ~= false
     local controller = usable and select(2, playerUnit())
+    if not controller then
+        walls.state = {}
+        navGrid.silenceWalls()
+        return
+    end
     local location = controller and pawn:K2_GetActorLocation()
     local floorZ = location and navGrid.groundBelow(location.X, location.Y, location.Z, location.Z - navGrid.halfHeight - navGrid.MAX_DROP)
     -- Ohne Boden faellt oder springt die Figur gerade. Nach einer Sperre gilt jede Wand wieder als neu.
     if not floorZ then
         walls.state, walls.location = {}, nil
+        navGrid.silenceWalls()
+        return
+    end
+    -- Mit Raumklaengen: durchgehender Ton je Richtung, solange dort eine Wand ist (Wunsch User 17.11.).
+    local sounds = menuInfo.sounds
+    if sounds then
+        local yaw = math.rad(controller.PlayerCameraManager:GetCameraRotation().Yaw)
+        local forwardX, forwardY = math.cos(yaw), math.sin(yaw)
+        local rightX, rightY = -forwardY, forwardX
+        for key, direction in ipairs(walls.DIRECTIONS) do
+            local dirX = forwardX * direction[1] + rightX * direction[2]
+            local dirY = forwardY * direction[1] + rightY * direction[2]
+            local index, hit = navGrid.probeWall(location.X, location.Y, floorZ, dirX, dirY)
+            if index and not walls.state[key] then
+                navGrid.logWall(direction, index, hit, location)
+            end
+            walls.state[key] = index
+            if index then
+                sounds.play("wand" .. key, "wand", true, walls.LOOP_GAINS[index] * menuInfo.settingScale("wallVolume"), direction[4] * 0.9,
+                    direction[3] / walls.LOOP_BASE_HERTZ, direction[1] < 0 and 0.5 or 0)
+            else
+                sounds.stop("wand" .. key)
+            end
+        end
         return
     end
     local moved = walls.location and distance2D(location, walls.location) > navGrid.radius / 4
@@ -4084,11 +4241,441 @@ function navGrid.tickWalls()
     end
 end
 
+function navGrid.silenceWalls()
+    if menuInfo.sounds then
+        for key in ipairs(navGrid.walls.DIRECTIONS) do
+            menuInfo.sounds.stop("wand" .. key)
+        end
+    end
+end
+
+-- Objektklaenge (Wunsch User 17.11.): Figuren, Tueren, Schalter, Truhen, Gegenstaende, Speicherpunkte und Ausgaenge
+-- in der Naehe klingen aus ihrer Richtung; beim automatischen Hinlaufen markiert ein schneller Puls das Ziel.
+-- Die Liste der Objekte entsteht alle RESCAN_SECONDS neu, Richtung und Lautstaerke folgen in jedem Durchlauf.
+local ambience = {
+    enabled = true,
+    RESCAN_SECONDS = 2,
+    MAX_VOICES = 6,
+    nextScan = 0,
+    objects = {},
+    -- Klasse, Klang (nil: nach Interaktionstyp). Die speziellen zuerst, jedes Objekt zaehlt einmal.
+    SOURCES = {
+        { "CPP_MapUnit_NPC", "person" },
+        { "CPP_MapGimmick_TreasureBox", "truhe" },
+        { "CPP_MapGimmick_SavePoint", "speicherpunkt" },
+        { "CPP_MapGimmick_Object_DoorBase", "tuer" },
+        { "CPP_MapGimmick_Trigger_DoorBase", "tuer" },
+        { "CPP_MapGimmick_Warp", "ausgang" },
+        { "CPP_MapTransitionTrigger", "ausgang" },
+        { "CPP_MapGimmick_ItemObjectBase", "gegenstand" },
+        { "CPP_MapGimmick", nil },
+    },
+    BY_INTERACT_TYPE = {
+        [4] = "objekt", [5] = "objekt", [6] = "objekt", [7] = "objekt", [8] = "schalter", [11] = "truhe",
+        [13] = "tuer", [27] = "objekt", [33] = "speicherpunkt", [34] = "ausgang", [35] = "ausgang", [36] = "objekt",
+    },
+    -- Grundlautstaerke (die Klaenge sind unterschiedlich laut), hoerbar ab/bis Entfernung in cm.
+    KINDS = {
+        person = { gain = 0.35, near = 150, far = 1200 },
+        tuer = { gain = 0.9, near = 150, far = 1500 },
+        schalter = { gain = 0.9, near = 150, far = 1300 },
+        truhe = { gain = 0.45, near = 150, far = 1500 },
+        gegenstand = { gain = 0.4, near = 150, far = 1300 },
+        objekt = { gain = 0.5, near = 150, far = 1200 },
+        speicherpunkt = { gain = 0.25, near = 200, far = 1800 },
+        ausgang = { gain = 0.35, near = 200, far = 1800 },
+    },
+    BEACON_GAIN = 0.8,
+    BEACON_MIN_GAIN = 0.3,
+    BEACON_FAR = 5000,
+}
+navGrid.ambience = ambience
+
+-- Nur was man gerade benutzen kann, nach denselben Regeln wie die Zielliste.
+function ambience.usable(actor, kind, source, interactType, path)
+    if kind == "ausgang" and source == "CPP_MapTransitionTrigger" then
+        return isExitUsable(actor)
+    end
+    if not isSelectable(actor) then
+        return false
+    end
+    if kind == "person" then
+        return menuInfo.npcTalkable(actor, interactType)
+    elseif kind == "truhe" then
+        local ok, opened = pcall(function()
+            return actor.m_IsOpen
+        end)
+        return not (ok and opened == true)
+    elseif kind == "gegenstand" then
+        return not isOpenedItem(actor, interactType)
+    elseif kind == "objekt" then
+        return (menuInfo.objectUsable(actor, interactType)) and not path:find("BlockObject_DLC", 1, true)
+    end
+    return true
+end
+
+-- Leicht verschiedene Tonhoehe je Objekt, damit zwei gleiche nicht zu einem verschmelzen.
+function ambience.pitchFor(path)
+    local sum = 0
+    for index = 1, #path do
+        sum = (sum * 31 + path:byte(index)) % 1000003
+    end
+    return 0.9 + (sum % 21) / 100
+end
+
+function ambience.rescan(origin)
+    local found, seen = {}, {}
+    for _, source in ipairs(ambience.SOURCES) do
+        for _, actor in ipairs(FindAllOf(source[1]) or {}) do
+            local path = actor:IsValid() and objectPath(actor)
+            if path and not seen[path] then
+                seen[path] = true
+                local okLocation, location = pcall(function()
+                    return actor:K2_GetActorLocation()
+                end)
+                local far = okLocation and distance2D(location, origin) or math.huge
+                local interactType = interactTypeOf(actor)
+                local kind = source[2] or (interactType and ambience.BY_INTERACT_TYPE[interactType])
+                if kind and menuInfo.settingOn("kind_" .. kind) and far < ambience.KINDS[kind].far + 500 and ambience.usable(actor, kind, source[1], interactType, path) then
+                    table.insert(found, { actor = actor, path = path, kind = kind, rate = ambience.pitchFor(path) })
+                end
+            end
+        end
+    end
+    ambience.objects = found
+end
+
+function ambience.kindOf(actor)
+    local path = objectPath(actor) or ""
+    for _, entry in ipairs(ambience.objects) do
+        if entry.path == path then
+            return entry.kind
+        end
+    end
+    for _, source in ipairs(ambience.SOURCES) do
+        if source[2] and path:find(source[1]:gsub("^CPP_", ""), 1, true) then
+            return source[2]
+        end
+    end
+    return nil
+end
+
+function ambience.tick()
+    local sounds = menuInfo.sounds
+    if not sounds then
+        return
+    end
+    local pawn, controller = playerUnit()
+    local walking = activeWalk ~= nil and menuInfo.settingOn("beacon")
+    if not (ambience.enabled or walking) or not pawn or (pawn.m_IsEnableUnitInput == false and not walking) then
+        sounds.beginFrame("obj")
+        sounds.endFrame("obj")
+        sounds.stop("beacon")
+        return
+    end
+    local location = pawn:K2_GetActorLocation()
+    local yaw = math.rad(controller.PlayerCameraManager:GetCameraRotation().Yaw)
+    local listener = { X = location.X, Y = location.Y, forwardX = math.cos(yaw), forwardY = math.sin(yaw) }
+    listener.rightX, listener.rightY = -listener.forwardY, listener.forwardX
+    local now = os.clock()
+    if ambience.enabled and now >= ambience.nextScan then
+        ambience.nextScan = now + ambience.RESCAN_SECONDS
+        ambience.rescan(location)
+    end
+    -- Ziel beim automatischen Hinlaufen: Ausgaenge und Tueren mit eigenem Puls.
+    local beaconPath = nil
+    if walking then
+        local target = activeWalk.actor
+        local okTarget, targetLocation = pcall(function()
+            return target:IsValid() and target:K2_GetActorLocation()
+        end)
+        local hasActor = okTarget and targetLocation and true or false
+        if not hasActor and activeWalk.points then
+            targetLocation = activeWalk.points[#activeWalk.points]
+        end
+        if targetLocation then
+            beaconPath = hasActor and objectPath(target)
+            local kind = hasActor and ambience.kindOf(target)
+            local name = (kind == "ausgang" or kind == "tuer") and "ausgang_ziel" or "ziel"
+            local pan, muffle, distance = sounds.spatial(listener, targetLocation)
+            local gain = math.max(ambience.BEACON_MIN_GAIN, sounds.falloff(distance, 200, ambience.BEACON_FAR))
+            sounds.play("beacon", name, true, gain * ambience.BEACON_GAIN * menuInfo.settingScale("beaconVolume"), pan, 1,
+                muffle)
+        end
+    else
+        sounds.stop("beacon")
+    end
+    -- Die naechsten Objekte klingen, weiter entfernte schweigen.
+    local audible = {}
+    local objectScale = menuInfo.settingScale("objectVolume")
+    for _, entry in ipairs(ambience.enabled and ambience.objects or {}) do
+        local okLocation, objectLocation = pcall(function()
+            return entry.actor:IsValid() and entry.actor:K2_GetActorLocation()
+        end)
+        if okLocation and objectLocation and entry.path ~= beaconPath then
+            local settings = ambience.KINDS[entry.kind]
+            local pan, muffle, distance = sounds.spatial(listener, objectLocation)
+            local gain = sounds.falloff(distance, settings.near, settings.far) * settings.gain * objectScale
+            if gain > 0.01 then
+                table.insert(audible, { entry = entry, gain = gain, pan = pan, muffle = muffle, distance = distance })
+            end
+        end
+    end
+    table.sort(audible, function(a, b)
+        return a.distance < b.distance
+    end)
+    sounds.beginFrame("obj")
+    for index = 1, math.min(#audible, ambience.MAX_VOICES) do
+        local item = audible[index]
+        sounds.play("obj" .. item.entry.path, item.entry.kind, true, item.gain, item.pan, item.entry.rate, item.muffle)
+    end
+    sounds.endFrame("obj")
+end
+
+function ambience.toggle()
+    menuInfo.setSetting("objects", not ambience.enabled)
+    speak(ambience.enabled and "Objektklänge an." or "Objektklänge aus.", true)
+end
+
 function navGrid.toggleWalls()
+    menuInfo.setSetting("walls", not navGrid.walls.enabled)
+    speak(navGrid.walls.enabled and "Wandtöne an." or "Wandtöne aus.", true)
+end
+
+-- Einstellungen der Mod (Wunsch User 17.11.): Strg+M oeffnet ein gesprochenes Menue. Bild auf/ab waehlt den Eintrag,
+-- Umschalt+Bild auf/ab oder Pos1 aendert ihn. Gespeichert in ..\einstellungen.txt (bleibt bei Updates erhalten).
+menuInfo.settings = {
+    open = false,
+    index = 1,
+    values = {},
+    FILE = "einstellungen.txt",
+    ITEMS = {
+        { key = "soundVolume", label = "Lautstärke aller Mod-Klänge", percent = true, default = 100 },
+        { key = "walls", label = "Wandtöne", default = true },
+        { key = "wallVolume", label = "Lautstärke Wandtöne", percent = true, default = 100 },
+        { key = "objects", label = "Objektklänge", default = true },
+        { key = "objectVolume", label = "Lautstärke Objektklänge", percent = true, default = 100 },
+        { key = "beacon", label = "Zielpuls beim automatischen Laufen", default = true },
+        { key = "beaconVolume", label = "Lautstärke Zielpuls", percent = true, default = 100 },
+        { key = "kind_person", label = "Klang für Personen", default = true },
+        { key = "kind_tuer", label = "Klang für Türen", default = true },
+        { key = "kind_schalter", label = "Klang für Schalter", default = true },
+        { key = "kind_truhe", label = "Klang für Truhen", default = true },
+        { key = "kind_gegenstand", label = "Klang für Gegenstände", default = true },
+        { key = "kind_objekt", label = "Klang für untersuchbare Objekte", default = true },
+        { key = "kind_speicherpunkt", label = "Klang für Speicherpunkte", default = true },
+        { key = "kind_ausgang", label = "Klang für Ausgänge", default = true },
+    },
+    PERCENT_STEP = 10,
+    PERCENT_MAX = 200,
+}
+
+function menuInfo.settings.path()
+    local info = debug and debug.getinfo and debug.getinfo(1, "S")
+    local scriptsDir = info and info.source and info.source:match("^@(.*[\\/])")
+    return (scriptsDir or "") .. "..\\" .. menuInfo.settings.FILE
+end
+
+function menuInfo.settings.item(key)
+    for _, item in ipairs(menuInfo.settings.ITEMS) do
+        if item.key == key then
+            return item
+        end
+    end
+    return nil
+end
+
+function menuInfo.settingValue(key)
+    local value = menuInfo.settings.values[key]
+    if value == nil then
+        local item = menuInfo.settings.item(key)
+        return item and item.default
+    end
+    return value
+end
+
+function menuInfo.settingOn(key)
+    return menuInfo.settingValue(key) ~= false
+end
+
+function menuInfo.settingScale(key)
+    return (tonumber(menuInfo.settingValue(key)) or 100) / 100
+end
+
+function menuInfo.settings.load()
+    local file = io.open(menuInfo.settings.path(), "r")
+    if not file then
+        return
+    end
+    for line in file:lines() do
+        local key, value = line:match("^%s*([%w_]+)%s*=%s*(.-)%s*$")
+        local item = key and menuInfo.settings.item(key)
+        if item and item.percent then
+            menuInfo.settings.values[key] = math.max(0, math.min(menuInfo.settings.PERCENT_MAX, tonumber(value) or item.default))
+        elseif item then
+            menuInfo.settings.values[key] = value == "an"
+        end
+    end
+    file:close()
+end
+
+function menuInfo.settings.save()
+    local file = io.open(menuInfo.settings.path(), "w")
+    if not file then
+        log("Einstellungen nicht gespeichert: " .. menuInfo.settings.path())
+        return
+    end
+    for _, item in ipairs(menuInfo.settings.ITEMS) do
+        local value = menuInfo.settingValue(item.key)
+        file:write(item.key, " = ", item.percent and tostring(value) or (value and "an" or "aus"), "\n")
+    end
+    file:close()
+end
+
+-- Werte auf Wandtoene, Objektklaenge und Mischer uebertragen.
+function menuInfo.settings.apply()
     local walls = navGrid.walls
-    walls.enabled = not walls.enabled
-    walls.state, walls.location = {}, nil
-    speak(walls.enabled and "Wandtöne an." or "Wandtöne aus.", true)
+    local wallsOn = menuInfo.settingOn("walls")
+    if walls.enabled ~= wallsOn then
+        walls.enabled = wallsOn
+        walls.state, walls.location = {}, nil
+        navGrid.silenceWalls()
+    end
+    navGrid.ambience.enabled = menuInfo.settingOn("objects")
+    navGrid.ambience.nextScan = 0
+    if menuInfo.sounds then
+        menuInfo.sounds.setMaster(menuInfo.settingScale("soundVolume"))
+    end
+end
+
+function menuInfo.setSetting(key, value)
+    menuInfo.settings.values[key] = value
+    menuInfo.settings.apply()
+    menuInfo.settings.save()
+end
+
+function menuInfo.settings.describe(item)
+    local value = menuInfo.settingValue(item.key)
+    return item.label .. ": " .. (item.percent and (value .. " Prozent") or (value and "an" or "aus"))
+end
+
+function menuInfo.settings.toggleMenu()
+    local settings = menuInfo.settings
+    settings.open = not settings.open
+    if settings.open then
+        speak("Mod-Einstellungen. " .. settings.describe(settings.ITEMS[settings.index])
+            .. ". Bild auf und ab wählen, Umschalt mit Bild auf und ab ändern, Strg M schließt.", true)
+    else
+        speak("Mod-Einstellungen geschlossen.", true)
+    end
+end
+
+function menuInfo.settings.move(steps)
+    local settings = menuInfo.settings
+    local count = #settings.ITEMS
+    settings.index = (settings.index - 1 + steps) % count + 1
+    speak(settings.describe(settings.ITEMS[settings.index]), true)
+end
+
+-- steps > 0 lauter oder an, < 0 leiser oder aus; nil schaltet um.
+function menuInfo.settings.change(steps)
+    local settings = menuInfo.settings
+    local item = settings.ITEMS[settings.index]
+    local value = menuInfo.settingValue(item.key)
+    if item.percent and steps == nil then
+        speak(settings.describe(item), true)
+        return
+    elseif item.percent then
+        value =math.max(0, math.min(settings.PERCENT_MAX, value + (steps or 1) * settings.PERCENT_STEP))
+    elseif steps == nil then
+        value = not value
+    else
+        value = steps > 0
+    end
+    menuInfo.setSetting(item.key, value)
+    speak(settings.describe(item), true)
+end
+
+menuInfo.settings.load()
+menuInfo.settings.apply()
+
+-- Sperren, die ein Aufzug selbst schaltet (m_BlockingBoxDataList je Halt): Nach den Spieldaten ist so eine Sperre
+-- zu, solange die Kabine nicht an ihrem Halt steht, und offen, wenn sie dort steht (Override-Eintraege: hier false,
+-- sonst true). Werft 18.11.: Unten mit Kabine unten traf die Kapselabfrage BlockingBox_1 trotzdem, der ganze untere
+-- Bereich galt als versperrt ("erreichbar 0"), obwohl der Weg zum zweiten Aufzug dort entlangfuehrt. Daher entscheidet
+-- hier der Zustand des Aufzugs, nicht die Physik: offene Sperren werden bei den Abfragen ignoriert.
+navGrid.LIFT_BOX_SECONDS = 1
+navGrid.LIFT_AT_STOP = 200
+function navGrid.liftBoxes()
+    local now = os.clock()
+    local cache = navGrid.liftBoxCache
+    if cache and cache.generation == navGrid.generation and now < cache.expires then
+        return cache
+    end
+    local open, states = {}, {}
+    for _, lift in ipairs(FindAllOf("CPP_MapGimmick") or {}) do
+        pcall(function()
+            if not lift:IsValid() or not objectName(lift):find("Elevator", 1, true) then
+                return
+            end
+            local level, name = (objectPath(lift) or ""):match("([%w_]+):PersistentLevel%.([%w_]+)$")
+            local stops = level and navGrid.liftStops and navGrid.liftStops[level .. ":" .. name]
+            if not stops or #stops < 2 then
+                return
+            end
+            local platform = menuInfo.liftPlatform(lift)
+            local current, currentDistance = nil, math.huge
+            for index, stop in ipairs(stops) do
+                local distance = menuInfo.distance3D(stop, platform)
+                if distance < currentDistance then
+                    current, currentDistance = index, distance
+                end
+            end
+            -- Faehrt die Kabine gerade, steht sie an keinem Halt: dann sind alle Sperren zu.
+            if currentDistance > navGrid.LIFT_AT_STOP then
+                current = nil
+            end
+            local floor = 0
+            lift.m_BlockingBoxDataList:ForEach(function(_, floorElement)
+                floor = floor + 1
+                floorElement:get().blokingBoxDataList:ForEach(function(_, boxElement)
+                    local data = boxElement:get()
+                    local box = data.pBlockingBox
+                    if box and box:IsValid() then
+                        local here = current == floor
+                        local closed = not here
+                        if data.bOverride_IsCollisionEnabled then
+                            if here then
+                                closed = data.isThisFloorCollisionEnabled
+                            else
+                                closed = data.isNotThisFloorCollisionEnabled
+                            end
+                        end
+                        if not closed then
+                            open[#open + 1] = box
+                        end
+                        states[#states + 1] = (name:match("_C_%d+$") or name) .. "/" .. floor .. " " .. objectName(box)
+                            .. (closed and " zu" or " offen")
+                    end
+                end)
+            end)
+        end)
+    end
+    local ignored = {}
+    for _, actor in ipairs(navGrid.ignored or {}) do
+        ignored[#ignored + 1] = actor
+    end
+    for _, box in ipairs(open) do
+        ignored[#ignored + 1] = box
+    end
+    local summary = table.concat(states, ", ")
+    if #states > 0 and summary ~= navGrid.liftBoxSummary then
+        log("Aufzugsperren: " .. summary)
+    end
+    navGrid.liftBoxSummary = summary
+    navGrid.liftBoxCache = { generation = navGrid.generation, expires = now + navGrid.LIFT_BOX_SECONDS,
+        ignored = ignored, open = #open }
+    return navGrid.liftBoxCache
 end
 
 -- Erreichbarkeit ab einem Punkt: fuer jeden Knoten der Vorgaenger auf dem kuerzesten Weg.
@@ -4103,13 +4690,33 @@ function navGrid.gateOpen(from, node)
     if navGrid.disabled or not navGrid.pawn or not navGrid.system then
         return true
     end
-    local key = from.key .. ">" .. node.key
+    -- Schritte direkt bei der Figur gelten laut Karte: Wo sie steht, kommt sie weg. Werft 18.11.: Der naechste
+    -- Rasterpunkt in der Aufzugkabine lag 31 cm neben der Figur halb in der Schachtwand, jede Abfrage von dort begann in
+    -- der Wand und meldete "Hindernis", der Start war in alle vier Richtungen eingeschlossen ("1 Punkte ... Start").
     local now = os.clock()
+    if not navGrid.pawnAt or now >= navGrid.pawnAtExpires then
+        local ok, at = pcall(function()
+            return navGrid.pawn:K2_GetActorLocation()
+        end)
+        navGrid.pawnAt = ok and at and { X = at.X, Y = at.Y, Z = at.Z } or nil
+        navGrid.pawnAtExpires = now + 0.25
+    end
+    local at = navGrid.pawnAt
+    if at and distance2D(from, at) <= navGrid.CELL * 1.5
+        and math.abs(from.Z + navGrid.halfHeight - at.Z) <= navGrid.halfHeight + 60 then
+        return true
+    end
+    local key = from.key .. ">" .. node.key
     local cached = navGrid.gateCache[key]
     if cached and now < cached.expires then
         return cached.open
     end
     local reason = nil
+    local boxesOk, boxes = pcall(navGrid.liftBoxes)
+    local savedIgnored = navGrid.ignored
+    if boxesOk and boxes then
+        navGrid.ignored = boxes.ignored
+    end
     local ok, open = pcall(function()
         local ground, groundHit = navGrid.groundBelow(node.X, node.Y, node.Z + 120, node.Z - 120)
         -- Windschrein 10.11.: Tor-Punkte auf der Fuge zwischen Absatz und Aufzugkabine, der Strahl fiel durch die Ritze
@@ -4132,6 +4739,7 @@ function navGrid.gateOpen(from, node)
         end
         return free
     end)
+    navGrid.ignored = savedIgnored
     if not ok then
         reason = "Fehler " .. tostring(open)
     end
@@ -7735,6 +8343,18 @@ end
 local function tickPathfinderKeys()
     local categorySteps, targetSteps, walkToggle = pendingCategorySteps, pendingTargetSteps, pendingWalkToggle
     pendingCategorySteps, pendingTargetSteps, pendingWalkToggle = 0, 0, false
+    -- Offenes Mod-Menue nimmt dieselben Tasten: Bild auf/ab waehlt, Umschalt+Bild auf/ab und Pos1 aendern.
+    if menuInfo.settings.open then
+        if categorySteps ~= 0 then
+            menuInfo.settings.change(categorySteps)
+        elseif targetSteps ~= 0 then
+            menuInfo.settings.move(targetSteps)
+        end
+        if walkToggle then
+            menuInfo.settings.change(nil)
+        end
+        return
+    end
     local worldMap = menuInfo.worldMapLayout
     if worldMap and worldMap:IsValid() and worldMap:IsActivated() then
         if targetSteps ~= 0 and categorySteps == 0 then
@@ -7866,6 +8486,13 @@ LoopInGameThreadWithDelay(TICK_MS, function()
     menuInfo.guardedTooltip()
 end)
 
+navGrid.guardedAmbience = guarded("Objektklaenge", navGrid.ambience.tick)
+menuInfo.guardedPipe = guarded("Pipe", menuInfo.tickPipe)
+LoopInGameThreadWithDelay(100, function()
+    menuInfo.guardedPipe()
+    navGrid.guardedAmbience()
+end)
+
 LoopInGameThreadWithDelay(STEER_TICK_MS, tickSteer)
 LoopInGameThreadWithDelay(STEER_TICK_MS, navGrid.safeTick)
 
@@ -7875,6 +8502,14 @@ end)
 
 RegisterKeyBind(Key.T, { ModifierKey.CONTROL }, function()
     ExecuteInGameThread(guarded("Wandtoene umschalten", navGrid.toggleWalls))
+end)
+
+RegisterKeyBind(Key.O, { ModifierKey.CONTROL }, function()
+    ExecuteInGameThread(guarded("Objektklaenge umschalten", navGrid.ambience.toggle))
+end)
+
+RegisterKeyBind(Key.M, { ModifierKey.CONTROL }, function()
+    ExecuteInGameThread(guarded("Mod-Einstellungen", menuInfo.settings.toggleMenu))
 end)
 
 RegisterKeyBind(Key.END, function()

@@ -22,3 +22,6 @@ __pycache__/
 
 # Prism wird zum Bauen der Sprach-DLL gebraucht
 !third_party/prism/bin/
+
+# Audiodeskription aus Visions of Grandshelt (420 MB, GPL-3): nur lokal, Herkunft siehe HERKUNFT.txt
+mod/FFRSAccess/Descriptions/

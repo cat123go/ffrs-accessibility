@@ -5,6 +5,9 @@
 //   <Prioritaet><UTF-8-Text>\n     Prioritaet: '1' = unterbricht, '0' = reiht sich ein
 //   T<Note>[,<Note>...]\n     spielt leise Toene nacheinander
 //     Note: <Hertz>:<Millisekunden>[:<Balance -1 links bis 1 rechts>[:<Lautstaerke, 1 = normal>]]
+//   AP<UTF-8-Pfad>\n          spielt eine WAV-Datei (PCM 16 Bit), beendet eine laufende
+//   AS\n / AH\n / AR\n         Aufnahme stoppen / anhalten / fortsetzen
+//   S<Befehl>\n               Raumklaenge (Mischer), siehe mixer::Command
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
@@ -191,10 +194,435 @@ void PlayTones(const std::string &notes) {
   }
 }
 
+// Audiodeskription: eine Aufnahme zur Zeit, ueber waveOut statt PlaySound, damit Toene sie nicht abbrechen
+// und sie sich anhalten laesst. Alle Aufrufe kommen aus dem Pipe-Thread.
+struct Recording {
+  HWAVEOUT device = nullptr;
+  WAVEHDR header{};
+  std::vector<char> samples;
+};
+Recording g_recording;
+
+void StopRecording() {
+  if (!g_recording.device) return;
+  waveOutReset(g_recording.device);
+  waveOutUnprepareHeader(g_recording.device, &g_recording.header, sizeof(WAVEHDR));
+  waveOutClose(g_recording.device);
+  g_recording = Recording{};
+}
+
+void PlayRecording(const std::string &utf8_path) {
+  StopRecording();
+  const int wide_length = MultiByteToWideChar(CP_UTF8, 0, utf8_path.c_str(), -1, nullptr, 0);
+  if (wide_length <= 0) return;
+  std::wstring path(static_cast<size_t>(wide_length), L'\0');
+  MultiByteToWideChar(CP_UTF8, 0, utf8_path.c_str(), -1, path.data(), wide_length);
+  FILE *file = _wfopen(path.c_str(), L"rb");
+  if (!file) {
+    Log("Aufnahme fehlt: %s", utf8_path.c_str());
+    return;
+  }
+  std::vector<char> bytes;
+  char chunk[65536];
+  size_t read;
+  while ((read = fread(chunk, 1, sizeof(chunk), file)) > 0) bytes.insert(bytes.end(), chunk, chunk + read);
+  fclose(file);
+  // RIFF-Bloecke durchgehen: fmt liefert das Format, data die Samples.
+  WAVEFORMATEX format{};
+  bool have_format = false;
+  size_t data_offset = 0, data_size = 0;
+  if (bytes.size() < 12 || memcmp(bytes.data(), "RIFF", 4) != 0 || memcmp(bytes.data() + 8, "WAVE", 4) != 0) {
+    Log("Keine WAV-Datei: %s", utf8_path.c_str());
+    return;
+  }
+  size_t position = 12;
+  while (position + 8 <= bytes.size()) {
+    uint32_t size = 0;
+    memcpy(&size, bytes.data() + position + 4, 4);
+    const size_t body = position + 8;
+    if (memcmp(bytes.data() + position, "fmt ", 4) == 0 && size >= 16 && body + 16 <= bytes.size()) {
+      memcpy(&format.wFormatTag, bytes.data() + body, 2);
+      memcpy(&format.nChannels, bytes.data() + body + 2, 2);
+      memcpy(&format.nSamplesPerSec, bytes.data() + body + 4, 4);
+      memcpy(&format.nAvgBytesPerSec, bytes.data() + body + 8, 4);
+      memcpy(&format.nBlockAlign, bytes.data() + body + 12, 2);
+      memcpy(&format.wBitsPerSample, bytes.data() + body + 14, 2);
+      have_format = true;
+    } else if (memcmp(bytes.data() + position, "data", 4) == 0) {
+      data_offset = body;
+      data_size = std::min<size_t>(size, bytes.size() - body);
+      break;
+    }
+    position = body + size + (size & 1);
+  }
+  if (!have_format || format.wFormatTag != WAVE_FORMAT_PCM || format.wBitsPerSample != 16 || !data_size) {
+    Log("WAV-Format nicht unterstuetzt: %s", utf8_path.c_str());
+    return;
+  }
+  g_recording.samples.assign(bytes.begin() + data_offset, bytes.begin() + data_offset + data_size);
+  if (waveOutOpen(&g_recording.device, WAVE_MAPPER, &format, 0, 0, CALLBACK_NULL) != MMSYSERR_NOERROR) {
+    Log("waveOutOpen fehlgeschlagen: %s", utf8_path.c_str());
+    g_recording = Recording{};
+    return;
+  }
+  g_recording.header.lpData = g_recording.samples.data();
+  g_recording.header.dwBufferLength = static_cast<DWORD>(g_recording.samples.size());
+  if (waveOutPrepareHeader(g_recording.device, &g_recording.header, sizeof(WAVEHDR)) != MMSYSERR_NOERROR ||
+      waveOutWrite(g_recording.device, &g_recording.header, sizeof(WAVEHDR)) != MMSYSERR_NOERROR) {
+    Log("Aufnahme nicht abspielbar: %s", utf8_path.c_str());
+    StopRecording();
+    return;
+  }
+  Log("AUFNAHME: %s", utf8_path.c_str());
+}
+
+void RecordingCommand(const std::string &command) {
+  if (command.rfind("P", 0) == 0) {
+    PlayRecording(command.substr(1));
+  } else if (command == "S") {
+    StopRecording();
+  } else if (command == "H") {
+    if (g_recording.device) waveOutPause(g_recording.device);
+  } else if (command == "R") {
+    if (g_recording.device) waveOutRestart(g_recording.device);
+  }
+}
+
+// Raumklaenge: eigener Mischer ueber waveOut, beliebig viele Stimmen gleichzeitig (Waende, Ziele, Figuren).
+// Lua steuert jede Stimme ueber eine ID; Lautstaerke, Balance, Tonhoehe und Daempfung gleiten weich,
+// damit beim Drehen und Laufen nichts knackt.
+namespace mixer {
+
+constexpr int kRate = 44100;
+constexpr int kBufferFrames = 1024;  // etwa 23 ms
+constexpr int kBufferCount = 4;
+constexpr double kGlide = 0.0015;     // Anteil je Sample, mit dem Werte ihrem Ziel folgen
+
+struct Voice {
+  const std::vector<float> *sample = nullptr;
+  std::string sample_name;
+  double position = 0;
+  bool loop = true;
+  bool stopping = false;
+  double gain = 0, target_gain = 0;
+  double pan = 0, target_pan = 0;
+  double rate = 1, target_rate = 1;
+  double muffle = 0, target_muffle = 0;
+  double low_left = 0, low_right = 0;
+};
+
+CRITICAL_SECTION g_lock;
+std::vector<std::pair<std::string, std::vector<float>>> g_samples;
+std::vector<std::pair<std::string, Voice>> g_voices;
+HWAVEOUT g_device = nullptr;
+HANDLE g_event = nullptr;
+WAVEHDR g_headers[kBufferCount]{};
+std::vector<int16_t> g_buffers[kBufferCount];
+double g_master = 1.0;
+
+const std::vector<float> *FindSample(const std::string &name) {
+  for (auto &entry : g_samples)
+    if (entry.first == name) return &entry.second;
+  return nullptr;
+}
+
+Voice *FindVoice(const std::string &id) {
+  for (auto &entry : g_voices)
+    if (entry.first == id) return &entry.second;
+  return nullptr;
+}
+
+// WAV laden (PCM 16 Bit oder Float 32 Bit, mono oder stereo), zu mono mischen, auf 44,1 kHz bringen.
+bool LoadWave(const std::wstring &path, std::vector<float> &out) {
+  FILE *file = _wfopen(path.c_str(), L"rb");
+  if (!file) return false;
+  std::vector<char> bytes;
+  char chunk[65536];
+  size_t read;
+  while ((read = fread(chunk, 1, sizeof(chunk), file)) > 0) bytes.insert(bytes.end(), chunk, chunk + read);
+  fclose(file);
+  if (bytes.size() < 12 || memcmp(bytes.data(), "RIFF", 4) != 0 || memcmp(bytes.data() + 8, "WAVE", 4) != 0)
+    return false;
+  uint16_t tag = 0, channels = 0, bits = 0;
+  uint32_t rate = 0;
+  size_t data_offset = 0, data_size = 0, position = 12;
+  while (position + 8 <= bytes.size()) {
+    uint32_t size = 0;
+    memcpy(&size, bytes.data() + position + 4, 4);
+    const size_t body = position + 8;
+    if (memcmp(bytes.data() + position, "fmt ", 4) == 0 && size >= 16 && body + 16 <= bytes.size()) {
+      memcpy(&tag, bytes.data() + body, 2);
+      memcpy(&channels, bytes.data() + body + 2, 2);
+      memcpy(&rate, bytes.data() + body + 4, 4);
+      memcpy(&bits, bytes.data() + body + 14, 2);
+      if (tag == 0xFFFE && size >= 26) memcpy(&tag, bytes.data() + body + 24, 2);  // WAVE_FORMAT_EXTENSIBLE
+    } else if (memcmp(bytes.data() + position, "data", 4) == 0) {
+      data_offset = body;
+      data_size = std::min<size_t>(size, bytes.size() - body);
+      break;
+    }
+    position = body + size + (size & 1);
+  }
+  const bool pcm16 = tag == 1 && bits == 16, float32 = tag == 3 && bits == 32;
+  if (!channels || !rate || !data_size || !(pcm16 || float32)) return false;
+  const size_t frame_bytes = static_cast<size_t>(channels) * bits / 8;
+  const size_t frames = data_size / frame_bytes;
+  std::vector<float> mono(frames);
+  for (size_t f = 0; f < frames; ++f) {
+    double sum = 0;
+    for (int c = 0; c < channels; ++c) {
+      const char *p = bytes.data() + data_offset + f * frame_bytes + c * (bits / 8);
+      if (pcm16) {
+        int16_t v;
+        memcpy(&v, p, 2);
+        sum += v / 32768.0;
+      } else {
+        float v;
+        memcpy(&v, p, 4);
+        sum += v;
+      }
+    }
+    mono[f] = static_cast<float>(sum / channels);
+  }
+  if (rate == kRate) {
+    out.swap(mono);
+    return true;
+  }
+  const double step = static_cast<double>(rate) / kRate;
+  const size_t count = static_cast<size_t>(frames / step);
+  out.resize(count);
+  for (size_t i = 0; i < count; ++i) {
+    const double source = i * step;
+    const size_t index = static_cast<size_t>(source);
+    const double fraction = source - index;
+    const float next = index + 1 < frames ? mono[index + 1] : mono[index];
+    out[i] = static_cast<float>(mono[index] * (1 - fraction) + next * fraction);
+  }
+  return true;
+}
+
+void Mix(int16_t *target) {
+  static std::vector<double> left, right;
+  left.assign(kBufferFrames, 0);
+  right.assign(kBufferFrames, 0);
+  EnterCriticalSection(&g_lock);
+  for (auto &entry : g_voices) {
+    Voice &v = entry.second;
+    const auto &s = *v.sample;
+    const double length = static_cast<double>(s.size());
+    if (length < 2) {
+      v.stopping = true;
+      v.gain = 0;
+      continue;
+    }
+    for (int i = 0; i < kBufferFrames; ++i) {
+      v.gain += (v.target_gain - v.gain) * kGlide * 2;
+      v.pan += (v.target_pan - v.pan) * kGlide;
+      v.rate += (v.target_rate - v.rate) * kGlide;
+      v.muffle += (v.target_muffle - v.muffle) * kGlide;
+      if (v.position >= length - 1) {
+        if (!v.loop) {
+          v.stopping = true;
+          v.target_gain = v.gain = 0;
+          break;
+        }
+        v.position = std::fmod(v.position, length - 1);
+      }
+      const size_t index = static_cast<size_t>(v.position);
+      const double fraction = v.position - index;
+      const double value = s[index] * (1 - fraction) + s[index + 1] * fraction;
+      v.position += v.rate;
+      // Gleichleistungs-Balance; die Daempfung (Ziel hinter der Figur) ist ein einfacher Tiefpass je Seite.
+      const double angle = (v.pan + 1) * 0.78539816339744830962;
+      const double coefficient = 1.0 - 0.92 * v.muffle;
+      v.low_left += (value * std::cos(angle) - v.low_left) * coefficient;
+      v.low_right += (value * std::sin(angle) - v.low_right) * coefficient;
+      left[i] += v.low_left * v.gain;
+      right[i] += v.low_right * v.gain;
+    }
+  }
+  // Ausgeklungene Stimmen entfernen.
+  g_voices.erase(std::remove_if(g_voices.begin(), g_voices.end(),
+                                [](const auto &entry) {
+                                  return entry.second.stopping && entry.second.gain < 0.0005;
+                                }),
+                 g_voices.end());
+  const double master = g_master;
+  LeaveCriticalSection(&g_lock);
+  for (int i = 0; i < kBufferFrames; ++i) {
+    // Weiche Begrenzung, falls viele Stimmen zusammenkommen.
+    target[i * 2] = static_cast<int16_t>(std::tanh(left[i] * master) * 32000);
+    target[i * 2 + 1] = static_cast<int16_t>(std::tanh(right[i] * master) * 32000);
+  }
+}
+
+DWORD WINAPI MixThread(LPVOID) {
+  for (;;) {
+    WaitForSingleObject(g_event, 50);
+    for (int b = 0; b < kBufferCount; ++b) {
+      if (g_headers[b].dwFlags & WHDR_DONE) {
+        Mix(g_buffers[b].data());
+        g_headers[b].dwFlags &= ~WHDR_DONE;
+        waveOutWrite(g_device, &g_headers[b], sizeof(WAVEHDR));
+      }
+    }
+  }
+}
+
+bool Start() {
+  if (g_device) return true;
+  InitializeCriticalSection(&g_lock);
+  g_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+  WAVEFORMATEX format{};
+  format.wFormatTag = WAVE_FORMAT_PCM;
+  format.nChannels = 2;
+  format.nSamplesPerSec = kRate;
+  format.wBitsPerSample = 16;
+  format.nBlockAlign = 4;
+  format.nAvgBytesPerSec = kRate * 4;
+  if (waveOutOpen(&g_device, WAVE_MAPPER, &format, reinterpret_cast<DWORD_PTR>(g_event), 0, CALLBACK_EVENT) !=
+      MMSYSERR_NOERROR) {
+    g_device = nullptr;
+    Log("Mischer: waveOutOpen fehlgeschlagen");
+    return false;
+  }
+  for (int b = 0; b < kBufferCount; ++b) {
+    g_buffers[b].assign(kBufferFrames * 2, 0);
+    g_headers[b].lpData = reinterpret_cast<LPSTR>(g_buffers[b].data());
+    g_headers[b].dwBufferLength = kBufferFrames * 4;
+    waveOutPrepareHeader(g_device, &g_headers[b], sizeof(WAVEHDR));
+    waveOutWrite(g_device, &g_headers[b], sizeof(WAVEHDR));
+  }
+  HANDLE thread = CreateThread(nullptr, 0, MixThread, nullptr, 0, nullptr);
+  if (thread) {
+    SetThreadPriority(thread, THREAD_PRIORITY_ABOVE_NORMAL);
+    CloseHandle(thread);
+  }
+  Log("Mischer bereit");
+  return true;
+}
+
+std::vector<std::string> Split(const std::string &text) {
+  std::vector<std::string> parts;
+  size_t start = 0;
+  for (;;) {
+    size_t tab = text.find('\t', start);
+    parts.push_back(text.substr(start, tab == std::string::npos ? std::string::npos : tab - start));
+    if (tab == std::string::npos) break;
+    start = tab + 1;
+  }
+  return parts;
+}
+
+void StopAll() {
+  if (!g_device) return;
+  EnterCriticalSection(&g_lock);
+  for (auto &entry : g_voices) {
+    entry.second.stopping = true;
+    entry.second.target_gain = 0;
+  }
+  LeaveCriticalSection(&g_lock);
+}
+
+// L<Name>\t<Pfad>                                   Klang laden (ersetzt einen gleichnamigen)
+// P<ID>\t<Name>\t<Schleife 0/1>\t<Lautst.>\t<Balance>\t<Tempo>\t<Daempfung 0..1>
+//                                                   Stimme starten oder, wenn schon da, nachfuehren
+// S<ID>   Stimme ausblenden      X   alle ausblenden      M<Lautstaerke>   Gesamtlautstaerke
+void Command(const std::string &command) {
+  if (command.empty() || !Start()) return;
+  const char kind = command[0];
+  const auto parts = Split(command.substr(1));
+  if (kind == 'L' && parts.size() >= 2) {
+    const int wide_length = MultiByteToWideChar(CP_UTF8, 0, parts[1].c_str(), -1, nullptr, 0);
+    std::wstring path(static_cast<size_t>(std::max(wide_length, 1)), L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, parts[1].c_str(), -1, path.data(), wide_length);
+    std::vector<float> data;
+    if (!LoadWave(path, data)) {
+      Log("Klang nicht ladbar: %s", parts[1].c_str());
+      return;
+    }
+    EnterCriticalSection(&g_lock);
+    // Stimmen mit dem alten Klang zeigen auf seine Daten: erst beenden.
+    g_voices.erase(std::remove_if(g_voices.begin(), g_voices.end(),
+                                  [&](const auto &entry) { return entry.second.sample_name == parts[0]; }),
+                   g_voices.end());
+    bool replaced = false;
+    for (auto &entry : g_samples) {
+      if (entry.first == parts[0]) {
+        entry.second.swap(data);
+        replaced = true;
+      }
+    }
+    if (!replaced) {
+      g_samples.reserve(64);  // Zeiger der Stimmen bleiben gueltig, solange nicht umkopiert wird
+      if (g_samples.size() < g_samples.capacity()) g_samples.emplace_back(parts[0], std::move(data));
+    }
+    LeaveCriticalSection(&g_lock);
+  } else if (kind == 'P' && parts.size() >= 7) {
+    EnterCriticalSection(&g_lock);
+    const std::vector<float> *sample = FindSample(parts[1]);
+    if (sample) {
+      Voice *voice = FindVoice(parts[0]);
+      const double gain = std::clamp(atof(parts[3].c_str()), 0.0, 2.0);
+      const double pan = std::clamp(atof(parts[4].c_str()), -1.0, 1.0);
+      const double rate = std::clamp(atof(parts[5].c_str()), 0.1, 4.0);
+      const double muffle = std::clamp(atof(parts[6].c_str()), 0.0, 1.0);
+      if (voice && voice->sample_name != parts[1]) {
+        voice->stopping = true;
+        voice->target_gain = 0;
+        voice->sample_name += "\x01";  // alte Stimme klingt aus, die neue bekommt eine eigene ID
+        for (auto &entry : g_voices)
+          if (&entry.second == voice) entry.first += "\x01";
+        voice = nullptr;
+      }
+      if (!voice) {
+        Voice fresh;
+        fresh.sample = sample;
+        fresh.sample_name = parts[1];
+        fresh.pan = pan;
+        fresh.rate = rate;
+        fresh.muffle = muffle;
+        g_voices.emplace_back(parts[0], fresh);
+        voice = &g_voices.back().second;
+      }
+      voice->loop = parts[2] == "1";
+      voice->stopping = false;
+      voice->target_gain = gain;
+      voice->target_pan = pan;
+      voice->target_rate = rate;
+      voice->target_muffle = muffle;
+    }
+    LeaveCriticalSection(&g_lock);
+  } else if (kind == 'S' && !parts.empty()) {
+    EnterCriticalSection(&g_lock);
+    if (Voice *voice = FindVoice(parts[0])) {
+      voice->stopping = true;
+      voice->target_gain = 0;
+    }
+    LeaveCriticalSection(&g_lock);
+  } else if (kind == 'X') {
+    StopAll();
+  } else if (kind == 'M' && !parts.empty()) {
+    EnterCriticalSection(&g_lock);
+    g_master = std::clamp(atof(parts[0].c_str()), 0.0, 2.0);
+    LeaveCriticalSection(&g_lock);
+  }
+}
+
+}  // namespace mixer
+
 void SpeakLine(PrismBackend *backend, const std::string &line) {
   if (line.size() < 2) return;
   if (line[0] == 'T') {
     PlayTones(line.substr(1));
+    return;
+  }
+  if (line[0] == 'A') {
+    RecordingCommand(line.substr(1));
+    return;
+  }
+  if (line[0] == 'S') {
+    mixer::Command(line.substr(1));
     return;
   }
   bool interrupt = line[0] == '1';
@@ -223,13 +651,18 @@ DWORD WINAPI PipeThread(LPVOID) {
         pending.append(buffer, read);
         size_t newline;
         while ((newline = pending.find('\n')) != std::string::npos) {
-          if (backend) SpeakLine(backend, pending.substr(0, newline));
+          const std::string line = pending.substr(0, newline);
+          // Aufnahmen und Raumklaenge brauchen kein Prism, Toene und Sprache schon.
+          if (backend || (!line.empty() && (line[0] == 'A' || line[0] == 'S'))) SpeakLine(backend, line);
           pending.erase(0, newline + 1);
         }
       }
     }
     DisconnectNamedPipe(g_pipe);
     pending.clear();
+    // Lua hat die Pipe geschlossen (Neuladen mit Strg+F9): Dauerklaenge sollen nicht weiterlaufen.
+    mixer::StopAll();
+    StopRecording();
   }
 }
 

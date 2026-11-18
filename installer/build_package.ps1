@@ -40,9 +40,11 @@ Set-Content -Path (Join-Path $ue4ss 'UE4SS-settings.ini') -Value $settings -Enco
 
 # Mod: nur mitgelieferte Daten, keine beim Spielen gelernten oder gescannten Dateien.
 $scripts = Join-Path $root 'mod\FFRSAccess\Scripts'
-Copy-Item (Join-Path $scripts 'main.lua'), (Join-Path $scripts 'namen_spiel.txt'), (Join-Path $scripts 'namen_gelernt.txt') (Join-Path $mod 'Scripts')
+Copy-Item (Join-Path $scripts 'main.lua'), (Join-Path $scripts 'narration.lua'), (Join-Path $scripts 'sounds.lua'),(Join-Path $scripts 'namen_spiel.txt'), (Join-Path $scripts 'namen_gelernt.txt') (Join-Path $mod 'Scripts')
 Copy-Item (Join-Path $scripts 'karte_*.txt') (Join-Path $mod 'Scripts')
 Copy-Item (Join-Path $root 'build\ffrs_speech.dll'), (Join-Path $root 'build\prism.dll') (Join-Path $mod 'bin')
+New-Item -ItemType Directory -Force (Join-Path $mod 'Sounds') | Out-Null
+Copy-Item (Join-Path $root 'mod\FFRSAccess\Sounds\*.wav') (Join-Path $mod 'Sounds')
 Set-Content -Path (Join-Path $mod 'version.txt') -Value $version -Encoding Ascii
 
 # Installer; PowerShell 5.1 liest Skripte ohne BOM als ANSI, die Umlaute brauchen UTF-8 mit BOM.

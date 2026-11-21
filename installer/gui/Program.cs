@@ -349,6 +349,117 @@ namespace FFRSSetup
         }
     }
 
+    // Audiodeskription fuer Zwischensequenzen (aus Visions of Grandshelt, GPL-3, etwa 400 MB) liegt als eigene Datei
+    // FFRSAccess-Audiodeskription-<Pruefwert>.zip im Release, damit Updates klein bleiben. Descriptions\stand.txt
+    // merkt sich den installierten Pruefwert; geladen wird nur, wenn auf GitHub ein anderer liegt.
+    internal static class Descriptions
+    {
+        private static readonly Regex AssetPattern = new Regex(@"^FFRSAccess-Audiodeskription-([0-9a-f]+)\.zip$", RegexOptions.IgnoreCase);
+        private const string FolderName = "Descriptions";
+        private const string StampName = "stand.txt";
+
+        // Gibt null zurueck, wenn alles in Ordnung ist, sonst einen Hinweis fuer die Abschlussmeldung.
+        // Die Mod laeuft auch ohne Audiodeskription, deshalb bricht ein Fehler hier die Installation nicht ab.
+        public static async Task<string> UpdateAsync(string game, Action<string> report)
+        {
+            var modDir = Path.Combine(game, @"FFRS\Binaries\Win64\ue4ss\Mods\FFRSAccess");
+            var folder = Path.Combine(modDir, FolderName);
+            var stampPath = Path.Combine(folder, StampName);
+            string installed = "";
+            try
+            {
+                if (File.Exists(stampPath))
+                    installed = File.ReadAllText(stampPath).Trim();
+            }
+            catch (Exception)
+            {
+            }
+            Updater.Asset asset;
+            try
+            {
+                report("Suche Audiodeskription auf GitHub …");
+                asset = await Updater.FindNewestAssetAsync(AssetPattern);
+            }
+            catch (Exception ex)
+            {
+                report("Audiodeskription: Suche fehlgeschlagen: " + ex.Message);
+                return installed.Length > 0 ? null
+                    : "Die Audiodeskription konnte nicht geladen werden, weil GitHub nicht erreichbar war. Das Setup bei bestehender Internetverbindung einfach noch einmal starten.";
+            }
+            if (asset == null)
+            {
+                report("Audiodeskription: Auf GitHub liegt keine.");
+                return null;
+            }
+            var stamp = AssetPattern.Match(asset.Name).Groups[1].Value.ToLowerInvariant();
+            if (string.Equals(stamp, installed, StringComparison.OrdinalIgnoreCase) && File.Exists(Path.Combine(folder, "cues.tsv")))
+            {
+                report("Audiodeskription ist schon aktuell.");
+                return null;
+            }
+            report($"Lade Audiodeskription herunter, {asset.Size / (1024 * 1024)} MB. Das kann einige Minuten dauern …");
+            var zipPath = Path.Combine(Path.GetTempPath(), asset.Name);
+            try
+            {
+                await Updater.DownloadFileAsync(asset, zipPath, report);
+                report("Entpacke Audiodeskription …");
+                await Task.Run(() => Extract(zipPath, folder, stamp, report));
+                report("Audiodeskription installiert.");
+                return null;
+            }
+            catch (Exception ex)
+            {
+                report("Audiodeskription fehlgeschlagen: " + ex);
+                return "Die Audiodeskription konnte nicht installiert werden: " + ex.Message + " Die Mod funktioniert trotzdem. Das Setup später noch einmal starten.";
+            }
+            finally
+            {
+                try
+                {
+                    File.Delete(zipPath);
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+
+        // Erst in einen Nebenordner entpacken, dann tauschen: Bricht etwas ab, bleibt die alte Fassung ganz.
+        private static void Extract(string zipPath, string folder, string stamp, Action<string> report)
+        {
+            var staging = folder + ".neu";
+            if (Directory.Exists(staging))
+            {
+                Installer.MakeTreeWritable(staging, _ => { });
+                Directory.Delete(staging, true);
+            }
+            var root = Path.GetFullPath(staging) + "\\";
+            using (var zip = ZipFile.OpenRead(zipPath))
+            {
+                foreach (var entry in zip.Entries)
+                {
+                    var name = entry.FullName.Replace('\\', '/');
+                    if (name.EndsWith("/") || !name.StartsWith(FolderName + "/", StringComparison.OrdinalIgnoreCase))
+                        continue;
+                    var target = Path.GetFullPath(Path.Combine(staging, name.Substring(FolderName.Length + 1).Replace('/', '\\')));
+                    if (!target.StartsWith(root, StringComparison.OrdinalIgnoreCase))
+                        throw new InvalidDataException("Ungültiger Pfad im Archiv: " + name);
+                    Directory.CreateDirectory(Path.GetDirectoryName(target));
+                    entry.ExtractToFile(target, true);
+                }
+            }
+            if (!File.Exists(Path.Combine(staging, "cues.tsv")))
+                throw new InvalidDataException("Im Archiv fehlt cues.tsv.");
+            File.WriteAllText(Path.Combine(staging, StampName), stamp);
+            if (Directory.Exists(folder))
+            {
+                Installer.MakeTreeWritable(folder, _ => { });
+                Directory.Delete(folder, true);
+            }
+            Directory.Move(staging, folder);
+        }
+    }
+
     // Neue Versionen liegen als Release auf GitHub, das Setup selbst ist die Datei darin. Betas (0.1.0b) sind als
     // Vorabversion markiert, deshalb die ganze Release-Liste statt /releases/latest.
     internal static class Updater
@@ -380,28 +491,106 @@ namespace FFRSSetup
             return client;
         }
 
-        public static async Task<Release> FindNewerAsync()
+        public sealed class Asset
+        {
+            public string Name;
+            public string DownloadUrl;
+            public long Size;
+        }
+
+        // Je Release (ohne Entwuerfe) die Version und ihre Dateien.
+        private static async Task<List<(string Version, List<Asset> Assets)>> ListReleasesAsync()
         {
             string json;
             using (var client = NewClient())
-                json = await client.GetStringAsync($"https://api.github.com/repos/{Repository}/releases?per_page=30");
-            Release best = null;
+                json = await client.GetStringAsync($"https://api.github.com/repos/{Repository}/releases?per_page=100");
+            var result = new List<(string, List<Asset>)>();
             foreach (var item in (IEnumerable)new JavaScriptSerializer().DeserializeObject(json))
             {
                 if (!(item is Dictionary<string, object> release) || (release.TryGetValue("draft", out var draft) && draft is bool isDraft && isDraft))
                     continue;
                 var version = ((release.TryGetValue("tag_name", out var tag) ? tag as string : null) ?? "").TrimStart('v', 'V');
-                if (Compare(version, best?.Version ?? CurrentVersion) <= 0 || !release.TryGetValue("assets", out var assets))
-                    continue;
-                foreach (var assetItem in (IEnumerable)assets)
+                var files = new List<Asset>();
+                if (release.TryGetValue("assets", out var assets) && assets is IEnumerable list)
                 {
-                    if (assetItem is Dictionary<string, object> asset && asset.TryGetValue("name", out var name)
-                        && string.Equals(name as string, AssetName, StringComparison.OrdinalIgnoreCase)
-                        && asset.TryGetValue("browser_download_url", out var url))
-                        best = new Release { Version = version, DownloadUrl = url as string };
+                    foreach (var assetItem in list)
+                    {
+                        if (assetItem is Dictionary<string, object> asset && asset.TryGetValue("name", out var name)
+                            && asset.TryGetValue("browser_download_url", out var url))
+                        {
+                            long size = asset.TryGetValue("size", out var sizeValue) && sizeValue != null ? Convert.ToInt64(sizeValue) : 0;
+                            files.Add(new Asset { Name = name as string ?? "", DownloadUrl = url as string, Size = size });
+                        }
+                    }
+                }
+                result.Add((version, files));
+            }
+            return result;
+        }
+
+        public static async Task<Release> FindNewerAsync()
+        {
+            Release best = null;
+            foreach (var (version, assets) in await ListReleasesAsync())
+            {
+                if (Compare(version, best?.Version ?? CurrentVersion) <= 0)
+                    continue;
+                var setup = assets.FirstOrDefault(a => string.Equals(a.Name, AssetName, StringComparison.OrdinalIgnoreCase));
+                if (setup != null)
+                    best = new Release { Version = version, DownloadUrl = setup.DownloadUrl };
+            }
+            return best;
+        }
+
+        // Die passende Datei aus dem neuesten Release, das eine hat.
+        public static async Task<Asset> FindNewestAssetAsync(Regex pattern)
+        {
+            Asset best = null;
+            string bestVersion = null;
+            foreach (var (version, assets) in await ListReleasesAsync())
+            {
+                var match = assets.FirstOrDefault(a => pattern.IsMatch(a.Name));
+                if (match != null && (bestVersion == null || Compare(version, bestVersion) > 0))
+                {
+                    best = match;
+                    bestVersion = version;
                 }
             }
             return best;
+        }
+
+        // Grosse Dateien in Stuecken auf die Platte statt in den Speicher, mit Fortschritt alle 10 Prozent.
+        public static async Task DownloadFileAsync(Asset asset, string target, Action<string> report)
+        {
+            using (var client = NewClient())
+            {
+                client.Timeout = TimeSpan.FromMinutes(2);
+                using (var response = await client.GetAsync(asset.DownloadUrl, HttpCompletionOption.ResponseHeadersRead))
+                {
+                    response.EnsureSuccessStatusCode();
+                    long total = response.Content.Headers.ContentLength ?? asset.Size;
+                    using (var input = await response.Content.ReadAsStreamAsync())
+                    using (var output = new FileStream(target, FileMode.Create, FileAccess.Write, FileShare.None, 81920, true))
+                    {
+                        var buffer = new byte[81920];
+                        long done = 0;
+                        int nextPercent = 10;
+                        int read;
+                        while ((read = await input.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                        {
+                            await output.WriteAsync(buffer, 0, read);
+                            done += read;
+                            if (total > 0 && done * 100 / total >= nextPercent && nextPercent < 100)
+                            {
+                                report($"{nextPercent} Prozent geladen.");
+                                nextPercent += 10;
+                            }
+                        }
+                        if (total > 0 && done != total)
+                            throw new IOException($"Download unvollständig: {done} von {total} Bytes.");
+                    }
+                }
+            }
         }
 
         public static async Task<string> DownloadAsync(Release release)
@@ -683,30 +872,56 @@ namespace FFRSSetup
         {
             var game = CheckGameDir();
             if (game != null)
-                Run("--install", game, () => Installer.Install(game, Report),
-                    "Installation fertig. Beim nächsten Spielstart sagt die Mod: Final Fantasy Resonance Zugang geladen.");
+                Run("--install", game, async () =>
+                {
+                    Installer.Install(game, Report);
+                    return await Descriptions.UpdateAsync(game, Report);
+                }, "Installation fertig. Beim nächsten Spielstart sagt die Mod: Final Fantasy Resonance Zugang geladen.");
         }
 
         private void RunUninstall()
         {
             var game = CheckGameDir();
             if (game != null)
-                Run("--uninstall", game, () => Installer.Uninstall(game, removeUe4ssBox.Checked, Report), "Deinstallation fertig.");
+                Run("--uninstall", game, () =>
+                {
+                    Installer.Uninstall(game, removeUe4ssBox.Checked, Report);
+                    return Task.FromResult<string>(null);
+                }, "Deinstallation fertig.");
         }
 
-        private void Run(string mode, string game, Action action, string doneMessage)
+        // Laeuft gerade eine Installation (mit Download), darf das Fenster nicht zugehen.
+        private bool running;
+
+        protected override void OnFormClosing(FormClosingEventArgs e)
+        {
+            if (running && e.CloseReason == CloseReason.UserClosing)
+            {
+                e.Cancel = true;
+                Report("Bitte warten, die Installation läuft noch.");
+                return;
+            }
+            base.OnFormClosing(e);
+        }
+
+        // action gibt einen Hinweis zurueck, der an die Abschlussmeldung angehaengt wird, oder null.
+        private async void Run(string mode, string game, Func<Task<string>> action, string doneMessage)
         {
             SetBusy(true);
+            running = true;
             Report(Installer.AccountInfo());
             Report("Spielordner: " + game);
             try
             {
-                action();
-                Report(doneMessage);
-                Tell(doneMessage, MessageBoxIcon.Information);
+                var note = await action();
+                running = false;
+                var message = string.IsNullOrEmpty(note) ? doneMessage : doneMessage + " " + note;
+                Report(message);
+                Tell(message, string.IsNullOrEmpty(note) ? MessageBoxIcon.Information : MessageBoxIcon.Warning);
             }
             catch (UnauthorizedAccessException ex)
             {
+                running = false;
                 Report("Keine Schreibrechte: " + ex.Message);
                 if (Installer.IsElevated())
                 {
@@ -729,11 +944,13 @@ namespace FFRSSetup
             }
             catch (Exception ex)
             {
+                running = false;
                 Report("Fehler: " + ex);
                 Tell("Das hat nicht geklappt: " + ex.Message + " Das Protokoll liegt unter " + Installer.LogPath + ".", MessageBoxIcon.Error);
             }
             finally
             {
+                running = false;
                 SetBusy(false);
             }
             statusBox.Focus();

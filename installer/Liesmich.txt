@@ -30,6 +30,13 @@ es eine, fragt es, ob es sie herunterladen und installieren soll. Bei Ja
 lädt es das neue Setup und installiert damit gleich in den Spielordner aus
 dem Feld. Versionen mit "b" am Ende (zum Beispiel 0.1.0b) sind Betaversionen.
 
+Audiodeskription für Zwischensequenzen: Das Setup lädt sie nach der
+Installation von GitHub, etwa 400 MB, beim ersten Mal kann das einige
+Minuten dauern. Danach lädt es sie nur, wenn es eine neue Fassung gibt.
+Ohne Internet installiert das Setup die Mod trotzdem, die Audiodeskription
+kommt dann beim nächsten Start des Setups. Installieren.bat aus dem
+Zip-Paket installiert keine Audiodeskription.
+
 Liegt das Spiel unter "Programme", fragt das Setup nach
 Administratorrechten und startet sich dafür neu.
 
@@ -89,3 +96,6 @@ Enthaltene Software
 
 UE4SS (RE-UE4SS), MIT-Lizenz, siehe Lizenzen\UE4SS.txt
 Prism und dessen Bestandteile, siehe Ordner Lizenzen\prism
+Audiodeskription aus der Mod "Visions of Grandshelt" von buu420
+(github.com/buu420/visions-of-grandshelt), GPL-3, unverändert; Lizenz und
+Herkunft im Ordner Descriptions (LICENSE-GPL3.txt, HERKUNFT.txt)

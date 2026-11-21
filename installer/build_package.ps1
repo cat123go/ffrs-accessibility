@@ -80,3 +80,28 @@ $setupExe = Join-Path $root 'dist\FFRSAccess-Setup.exe'
 Copy-Item (Join-Path $out 'FFRSAccess-Setup.exe') $setupExe -Force
 Remove-Item $out, $payloadZip -Recurse -Force
 Write-Output "Setup: $setupExe (Version $version)"
+
+# Audiodeskription (etwa 400 MB) als eigene Datei: Das Setup laedt sie nur, wenn sie sich geaendert hat. Der Name
+# traegt einen Pruefwert ueber Pfade und Inhalt aller Dateien, das Setup vergleicht ihn mit Descriptions\stand.txt.
+Get-ChildItem (Join-Path $root 'dist') -Filter 'FFRSAccess-Audiodeskription-*.zip' | Remove-Item -Force
+$descriptions = Join-Path $root 'mod\FFRSAccess\Descriptions'
+if (-not (Test-Path (Join-Path $descriptions 'cues.tsv'))) {
+    Write-Warning "Audiodeskription fehlt ($descriptions), Release bekommt keine."
+    return
+}
+$sha = [System.Security.Cryptography.SHA256]::Create()
+$lines = Get-ChildItem $descriptions -Recurse -File | Where-Object { $_.Name -ne 'stand.txt' } |
+    ForEach-Object {
+        $relative = $_.FullName.Substring($descriptions.Length + 1).Replace('\', '/')
+        "$relative $((Get-FileHash $_.FullName -Algorithm SHA256).Hash)"
+    } | Sort-Object -CaseSensitive
+$stamp = -join ($sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($lines -join "`n")) | Select-Object -First 6 | ForEach-Object { $_.ToString('x2') })
+$audioZip = Join-Path $root "dist\FFRSAccess-Audiodeskription-$stamp.zip"
+$audioStaging = Join-Path $root 'dist\audio'
+if (Test-Path $audioStaging) { Remove-Item $audioStaging -Recurse -Force }
+New-Item -ItemType Directory -Force $audioStaging | Out-Null
+Copy-Item $descriptions $audioStaging -Recurse
+Remove-Item (Join-Path $audioStaging 'Descriptions\stand.txt') -ErrorAction SilentlyContinue
+[System.IO.Compression.ZipFile]::CreateFromDirectory($audioStaging, $audioZip, [System.IO.Compression.CompressionLevel]::Optimal, $false)
+Remove-Item $audioStaging -Recurse -Force
+Write-Output "Audiodeskription: $audioZip"

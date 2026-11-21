@@ -1,7 +1,9 @@
 # Veroeffentlicht die Version aus VERSION auf GitHub: Paket bauen, Tag v<Version> setzen und pushen,
 # Release mit Setup und Zip anlegen. Versionen mit Buchstaben (0.1.0b) werden als Vorabversion markiert.
 param(
-    [string]$Notes = ""
+    [string]$Notes = "",
+    # Spielordner mit laufendem UE4SS, aus dem das Paket UE4SS nimmt; leer: Vorgabe aus build_package.ps1.
+    [string]$GameDir = ""
 )
 $ErrorActionPreference = 'Stop'
 $root = Split-Path $PSScriptRoot -Parent
@@ -19,13 +21,26 @@ if (git -C $root status --porcelain -- $learned) {
 if (git -C $root status --porcelain) { throw "Es gibt nicht eingecheckte Aenderungen. Erst committen." }
 if (git -C $root tag --list $tag) { throw "Tag $tag gibt es schon. VERSION erhoehen." }
 
-& (Join-Path $PSScriptRoot 'build_package.ps1')
+$buildArgs = @{}
+if ($GameDir) { $buildArgs.GameDir = $GameDir }
+& (Join-Path $PSScriptRoot 'build_package.ps1') @buildArgs
 if ($LASTEXITCODE) { throw "Paketbau fehlgeschlagen" }
 
 git -C $root tag -a $tag -m "Version $version"
 git -C $root push origin HEAD $tag
 
-$assets = (Join-Path $root 'dist\FFRSAccess-Setup.exe'), (Join-Path $root 'dist\FFRSAccess.zip')
+$assets = @((Join-Path $root 'dist\FFRSAccess-Setup.exe'), (Join-Path $root 'dist\FFRSAccess.zip'))
+# Audiodeskription nur hochladen, wenn es sie mit diesem Pruefwert noch in keinem Release gibt.
+$audioZip = Get-ChildItem (Join-Path $root 'dist') -Filter 'FFRSAccess-Audiodeskription-*.zip' | Select-Object -First 1
+if ($audioZip) {
+    $known = gh api "repos/derbruedi/ffrs-accessibility/releases?per_page=100" --jq '.[].assets[].name'
+    if ($LASTEXITCODE) { throw "Release-Liste nicht lesbar" }
+    if ($known -contains $audioZip.Name) {
+        Write-Output "Audiodeskription unveraendert ($($audioZip.Name)), wird nicht erneut hochgeladen."
+    } else {
+        $assets += $audioZip.FullName
+    }
+}
 if (-not $Notes) { $Notes = "Version $version. Setup herunterladen, Spiel beenden, Setup starten." }
 $flags = @()
 if ($version -match '[A-Za-z]') { $flags += '--prerelease' }

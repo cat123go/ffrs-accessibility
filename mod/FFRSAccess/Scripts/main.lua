@@ -3591,6 +3591,9 @@ end
 
 function navGrid.prepareTraces(pawn)
     navGrid.pawn = pawn
+    navGrid.pawnAt = nil
+    navGrid.gateCache = {}
+    navGrid.liftBoxCache = nil
     navGrid.system = StaticFindObject("/Script/Engine.Default__KismetSystemLibrary")
     navGrid.radius, navGrid.halfHeight = navGrid.SCAN_RADIUS, 100
     navGrid.profile = FName("Pawn")
@@ -3930,7 +3933,27 @@ function navGrid.checkMap()
     -- Direkt nach einer Szene lieferten die Abfragen keinen Boden (05.11. 21:33), danach blieb die Wegekarte
     -- fuer die ganze Karte aus. Deshalb im ausgeschalteten Zustand regelmaessig neu versuchen.
     local now = os.clock()
-    if path ~= navGrid.pawnPath or not navGrid.pawn or (navGrid.disabled and now >= (navGrid.retryAt or 0)) then
+    -- Nach einem Kampf setzt das Spiel die Figur neu, oft unter demselben Namen (Werft 18.11.: nach zwei Kaempfen
+    -- schlug jede Pruefung fehl, der Start war eingeschlossen). Daher auch das Objekt selbst vergleichen.
+    local samePawn = false
+    if navGrid.pawn then
+        local validOk, valid = pcall(function()
+            return navGrid.pawn:IsValid()
+        end)
+        samePawn = validOk and valid == true
+        if samePawn then
+            local addressOk, same = pcall(function()
+                return navGrid.pawn:GetAddress() == pawn:GetAddress()
+            end)
+            if addressOk then
+                samePawn = same
+            end
+        end
+    end
+    if not samePawn and navGrid.pawn then
+        log("Wegekarte: Figur neu gesetzt")
+    end
+    if path ~= navGrid.pawnPath or not samePawn or (navGrid.disabled and now >= (navGrid.retryAt or 0)) then
         navGrid.pawnPath = path
         navGrid.retryAt = now + navGrid.RETRY_SECONDS
         navGrid.prepareTraces(pawn)
@@ -4746,6 +4769,12 @@ function navGrid.gateOpen(from, node)
     open = ok and open == true
     -- Diagnose (Windschrein 10.11.: eine Reihe Tor-Punkte schloss die Figur auf 40 Punkte ein, Grund unbekannt).
     if not open then
+        -- Je Minute neu zaehlen: Mit einer Grenze je Karte war die Diagnose nach den ersten Sekunden stumm.
+        if now >= (navGrid.gateLogReset or 0) then
+            navGrid.gateLogReset = now + 60
+            navGrid.gateLogCount = 0
+            navGrid.gateLogs = {}
+        end
         navGrid.gateLogs = navGrid.gateLogs or {}
         local logKey = navGrid.generation .. ":" .. node.key
         if not navGrid.gateLogs[logKey] and (navGrid.gateLogCount or 0) < 150 then
@@ -4763,11 +4792,33 @@ end
 -- auch wenn sie gerade woanders ist. Windschrein 10.11.: Halt ohne Kabine schloss den Bereich auf einen Punkt ein).
 navGrid.ASSUME_OPEN_RADIUS = 450
 navGrid.ASSUME_OPEN_HEIGHT = 250
-function navGrid.flood(start, openNear)
+navGrid.ASSUME_OPEN_BOX_MARGIN = 100
+-- openBoxes: Kaesten (Mitte, halbe Groesse) der Sperren, die der Aufzug an diesem Halt oeffnet. Windschrein 18.11.:
+-- Die Sperre am oberen Halt von _C_17 reichte ueber 4,5 m hinaus, die Ankunft blieb auf 61 Punkten eingeschlossen,
+-- das Netz fand die Aufzuege dahinter (_C_5, _C_3, _C_11) nicht und schickte in die Sackgasse oben an _C_2.
+-- openNear darf ein Punkt oder eine Liste von Punkten sein.
+function navGrid.flood(start, openNear, openBoxes)
     local previous, queue, head = { [start] = start }, { start }, 1
+    local margin = navGrid.ASSUME_OPEN_BOX_MARGIN
+    local points = openNear and (openNear.X and { openNear } or openNear) or {}
     local function assumedOpen(node)
-        return openNear and node.gate and distance2D(node, openNear) <= navGrid.ASSUME_OPEN_RADIUS
-            and math.abs(node.Z - openNear.Z) <= navGrid.ASSUME_OPEN_HEIGHT
+        if not node.gate then
+            return false
+        end
+        for _, point in ipairs(points) do
+            if distance2D(node, point) <= navGrid.ASSUME_OPEN_RADIUS
+                and math.abs(node.Z - point.Z) <= navGrid.ASSUME_OPEN_HEIGHT then
+                return true
+            end
+        end
+        for _, box in ipairs(openBoxes or {}) do
+            if math.abs(node.X - box.origin.X) <= box.extent.X + margin
+                and math.abs(node.Y - box.origin.Y) <= box.extent.Y + margin
+                and math.abs(node.Z - box.origin.Z) <= box.extent.Z + navGrid.ASSUME_OPEN_HEIGHT then
+                return true
+            end
+        end
+        return false
     end
     while queue[head] do
         local node = queue[head]
@@ -6101,6 +6152,37 @@ function navRoute.jumpAt(jumps, point)
     return nil
 end
 
+-- Sperren eines Aufzugs, die offen sind, wenn seine Kabine an Halt "floor" steht (gleiche Regel wie liftBoxes).
+function navRoute.liftFloorBoxes(lift, floor)
+    local boxes = {}
+    pcall(function()
+        local index = 0
+        lift.m_BlockingBoxDataList:ForEach(function(_, floorElement)
+            index = index + 1
+            if index ~= floor then
+                return
+            end
+            floorElement:get().blokingBoxDataList:ForEach(function(_, boxElement)
+                local data = boxElement:get()
+                local box = data.pBlockingBox
+                local closed = false
+                if data.bOverride_IsCollisionEnabled then
+                    closed = data.isThisFloorCollisionEnabled
+                end
+                if box and box:IsValid() and not closed then
+                    local origin, extent = {}, {}
+                    box:GetActorBounds(false, origin, extent, false)
+                    if origin.X and extent.X then
+                        boxes[#boxes + 1] = { origin = { X = origin.X, Y = origin.Y, Z = origin.Z },
+                            extent = { X = extent.X, Y = extent.Y, Z = extent.Z } }
+                    end
+                end
+            end)
+        end)
+    end)
+    return boxes
+end
+
 -- Alle Bereiche, die sich ab der Figur ueber Aufzuege erreichen lassen, in der Reihenfolge ihrer Kosten.
 function navRoute.liftExplore(origin)
     local start = navGrid.complete and navGrid.liftStops and navGrid.nearest(origin)
@@ -6115,6 +6197,18 @@ function navRoute.liftExplore(origin)
     local lifts = navRoute.liftList(origin)
     local jumps = navRoute.jumpList()
     local areas, open = {}, { { node = start, cost = 0, rides = 0 } }
+    -- Wo eine Kabine gerade steht, gilt der Einstieg laut Karte als offen (Windschrein 18.11.: an _C_5 unten meldete
+    -- die Reihe zwischen Absatz und Kabine "kein Boden", der Bereich dahinter mit _C_3 und _C_11 blieb unbekannt).
+    local parkedPoints, parkedBoxes = {}, {}
+    for _, lift in ipairs(lifts) do
+        local stop = lift.current and lift.stops[lift.current]
+        if stop and menuInfo.distance3D(stop, lift.platform) <= navGrid.LIFT_AT_STOP then
+            parkedPoints[#parkedPoints + 1] = stop
+            for _, box in ipairs(navRoute.liftFloorBoxes(lift.actor, lift.current)) do
+                parkedBoxes[#parkedBoxes + 1] = box
+            end
+        end
+    end
     local function covered(node)
         for _, area in ipairs(areas) do
             if area.previous[node] then
@@ -6132,7 +6226,22 @@ function navRoute.liftExplore(origin)
         end
         local entry = table.remove(open, bestIndex)
         if not covered(entry.node) then
-            entry.previous = navGrid.flood(entry.node, entry.openNear)
+            local points, boxes = {}, {}
+            for _, point in ipairs(parkedPoints) do
+                points[#points + 1] = point
+            end
+            for _, box in ipairs(parkedBoxes) do
+                boxes[#boxes + 1] = box
+            end
+            if entry.openNear then
+                points[#points + 1] = entry.openNear
+            end
+            if entry.openLift then
+                for _, box in ipairs(navRoute.liftFloorBoxes(entry.openLift, entry.openFloor)) do
+                    boxes[#boxes + 1] = box
+                end
+            end
+            entry.previous = navGrid.flood(entry.node, points, boxes)
             areas[#areas + 1] = entry
             -- Spruenge innerhalb der Karte, deren Ausloeser zu Fuss erreichbar ist.
             for _, jump in ipairs(jumps) do
@@ -6184,6 +6293,8 @@ function navRoute.liftExplore(origin)
                                 open[#open + 1] = {
                                     node = node,
                                     openNear = arrival,
+                                    openLift = lift.actor,
+                                    openFloor = to,
                                     how = (entry.how or "") .. string.format(" > %s %d-%d",
                                         lift.key:match("_C_%d+$") or lift.key, from, to),
                                     rides = entry.rides + 1,
